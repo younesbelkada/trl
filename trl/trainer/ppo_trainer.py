@@ -434,23 +434,31 @@ class PPOTrainer(BaseTrainer):
                 input_kwargs = {
                     "input_ids": input_ids,
                 }
-
+                
             with torch.no_grad():
                 logits, _, v = self.model(**input_kwargs)
                 ref_logits, _, _ = self.ref_model(**input_kwargs)
 
             if self.is_encoder_decoder:
-                logprobs = logprobs_from_logits(logits[:, :-1, :], decoder_input_ids[:, 1:])
-                ref_logprobs = logprobs_from_logits(ref_logits[:, :-1, :], decoder_input_ids[:, 1:])
+                logprobs = logprobs_from_logits(logits, decoder_input_ids)
+                ref_logprobs = logprobs_from_logits(ref_logits, decoder_input_ids)
             else:
-                logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-                ref_logprobs = logprobs_from_logits(ref_logits[:, :-1, :], input_ids[:, 1:])
+                logprobs = logprobs_from_logits(logits, input_ids)
+                ref_logprobs = logprobs_from_logits(ref_logits, input_ids)
+                
             for j in range(fbs):
-                start = len(query_batch[j]) - 1
-                end = len(query_batch[j]) + len(response_batch[j]) - 1
-                all_values.append(v[j, start - 1 : end - 1])
+                if self.is_encoder_decoder:
+                    # Decoder sentence starts always in the index 0 in the Enc-Dec Models
+                    start = 0
+                    end = len(response_batch[j])
+                else:
+                    start = len(query_batch[j]) - 1
+                    end = len(query_batch[j]) + len(response_batch[j]) - 1
+                
+                all_values.append(v[j, start:end])
                 all_logprobs.append(logprobs[j, start:end])
                 all_ref_logprobs.append(ref_logprobs[j, start:end])
+                
         return all_logprobs, all_ref_logprobs, all_values
 
     def train_minibatch(
@@ -566,9 +574,11 @@ class PPOTrainer(BaseTrainer):
 
         logits, _, vpred = self.model(**input_kwargs)
 
-        logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
-
-        logprob, vpred = logprob[:, -gen_len:], vpred[:, -gen_len - 1 : -1]
+        if self.is_encoder_decoder:
+            logprob = logprobs_from_logits(logits, model_input)
+        else:
+            logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
+            logprob, vpred = logprob[:, -gen_len:], vpred[:, -gen_len - 1 : -1]
 
         vpredclipped = clip_by_value(vpred, values - self.config.cliprange_value, values + self.config.cliprange_value)
 

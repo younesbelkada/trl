@@ -44,6 +44,8 @@ from trl.core import LengthSampler
 config = PPOConfig(
     model_name="google/flan-t5-small",
     learning_rate=1.41e-5,
+    batch_size=2,
+    forward_batch_size=2
 )
 
 # We then define the arguments to pass to the sentiment analysis pipeline.

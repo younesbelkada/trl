@@ -230,7 +230,7 @@ class PPOTrainer(BaseTrainer):
         # Step 3: Initialize optimizer and data collator
         self.data_collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
         if optimizer is None:
-            self.optimizer = Adam(self.model.parameters(), lr=self.config.learning_rate)
+            self.optimizer = Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.config.learning_rate)
         else:
             self.optimizer = optimizer
 
@@ -267,7 +267,7 @@ class PPOTrainer(BaseTrainer):
         if self.accelerator.is_main_process and self.config.log_with == "wandb":
             import wandb
 
-            wandb.watch(self.model, log="all")
+            # wandb.watch(self.model, log="all")
 
         if self.config.forward_batch_size > 1 and (self.is_encoder_decoder or self.tokenizer.padding_side == "left"):
             # warn users that this is not well supported yet
@@ -309,6 +309,7 @@ class PPOTrainer(BaseTrainer):
             batch_size=self.config.batch_size,
             collate_fn=data_collator,
             shuffle=True,
+            drop_last=True,
         )
         return dataloader
 
@@ -874,6 +875,11 @@ class PPOTrainer(BaseTrainer):
             logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()
             logs["env/reward_dist"] = rewards.cpu().numpy()
 
+            # manually cast in fp32 for bf16 torch tensors
+            for k, v in logs.items():
+                if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
+                    logs[k] = v.float()
+
             if self.config.log_with == "tensorboard":
                 # update the current step
                 self.current_step += 1
@@ -906,6 +912,6 @@ class PPOTrainer(BaseTrainer):
             f.write(model_card_content)
 
     def _save_pretrained(self, save_directory: str) -> None:
-        self.model.save_pretrained(save_directory)
+        self.accelerator.unwrap_model(self.model).save_pretrained(save_directory)
         self.tokenizer.save_pretrained(save_directory)
         self.create_model_card(save_directory)

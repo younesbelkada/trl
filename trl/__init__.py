@@ -10,3 +10,4 @@ from .models import (
     create_reference_model,
 )
 from .trainer import PPOConfig, PPOTrainer
+from .optimizer import Lion

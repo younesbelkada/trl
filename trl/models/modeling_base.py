@@ -18,11 +18,21 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
+
+from accelerate import init_empty_weights
+
 from transformers import PreTrainedModel
 
 
 LAYER_PATTERNS = ["transformer.h.{layer}", "model.decoder.layers.{layer}", "gpt_neox.layers.{layer}"]
 
+def recurse_setattr(module, name, value):
+    """A function to recursively set attributes to a module."""
+    if "." not in name:
+        setattr(module, name, value)
+    else:
+        name, rest = name.split(".", 1)
+        recurse_setattr(getattr(module, name), rest, value)
 
 class PreTrainedModelWrapper(nn.Module):
     r"""
@@ -203,18 +213,17 @@ class PreTrainedModelWrapper(nn.Module):
         raise NotImplementedError
 
 
+
 def create_reference_model(
     model: PreTrainedModelWrapper, num_shared_layers: int = None, pattern: str = None
 ) -> PreTrainedModelWrapper:
     """
     Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
-
     Args:
         model (`PreTrainedModelWrapper`): The model to be copied.
         num_shared_layers (`int`, *optional*): The number of initial layers that are shared between both models and kept frozen.
         pattern (`str`, *optional*): The shared layers are selected with a string pattern
             (e.g. "transformer.h.{layer}" for GPT2) and if a custom pattern is necessary it can be passed here.
-
     Returns
         `PreTrainedModelWrapper`
     """
@@ -269,3 +278,73 @@ def create_reference_model(
         param.requires_grad = False
 
     return ref_model.eval()
+# def create_reference_model(
+#     model: PreTrainedModelWrapper, num_shared_layers: int = None, pattern: str = None
+# ) -> PreTrainedModelWrapper:
+#     """
+#     Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
+
+#     Args:
+#         model (`PreTrainedModelWrapper`): The model to be copied.
+#         num_shared_layers (`int`, *optional*): The number of initial layers that are shared between both models and kept frozen.
+#         pattern (`str`, *optional*): The shared layers are selected with a string pattern
+#             (e.g. "transformer.h.{layer}" for GPT2) and if a custom pattern is necessary it can be passed here.
+
+#     Returns
+#         `PreTrainedModelWrapper`
+#     """
+
+#     parameter_names = [n for n, _ in model.named_parameters()]
+#     # if no layers are shared, return copy of model
+#     if num_shared_layers is None:
+#         ref_model = deepcopy(model)
+
+#         for param_name in parameter_names:
+#             param = ref_model.get_parameter(param_name)
+#             param.requires_grad = False
+#         return ref_model.eval()
+
+#     # identify layer name pattern
+#     if pattern is not None:
+#         pattern = pattern.format(layer=num_shared_layers)
+#     else:
+#         for pattern_candidate in LAYER_PATTERNS:
+#             pattern_candidate = pattern_candidate.format(layer=num_shared_layers)
+#             if any([pattern_candidate in name for name in parameter_names]):
+#                 pattern = pattern_candidate
+#                 break
+
+#     if pattern is None:
+#         raise ValueError("Layer pattern could not be matched.")
+
+#     # divide parameters in shared and unshared parameter lists
+#     shared_param_list = []
+#     unshared_param_list = []
+
+#     shared_parameter = True
+#     for name, param in model.named_parameters():
+#         if pattern in name:
+#             shared_parameter = False
+#         if shared_parameter:
+#             shared_param_list.append(name)
+#         else:
+#             unshared_param_list.append(name)
+
+#     ref_model = deepcopy(model).to("meta")
+
+#     # create reference of the original parameter if they are shared
+#     for param_name in shared_param_list:
+#         param = model.get_parameter(param_name)
+#         param.requires_grad = False
+
+#         recurse_setattr(ref_model, param_name, param)
+
+#     # for all other parameters just make sure they don't use gradients
+#     for param_name in unshared_param_list:
+#         param = model.get_parameter(param_name)
+#         param.requires_grad = False
+
+#         recurse_setattr(ref_model, param_name, deepcopy(param))
+#         # setattr(ref_model, param_name, deepcopy(param))
+
+#     return ref_model.eval()

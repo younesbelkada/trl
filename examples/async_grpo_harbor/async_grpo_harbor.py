@@ -164,6 +164,7 @@ def parse_args() -> argparse.Namespace:
     # Bound model calls; rewritten histories can still produce multiple training rows.
     p.add_argument("--agent-step-limit", type=int, default=12)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--project", default="async-grpo-harbor")
     p.add_argument("--trackio-space-id", default=None, help="host the trackio dashboard on a HF Space")
@@ -214,6 +215,7 @@ def main() -> None:
         save_steps=50,
         save_total_limit=3,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         max_steps=args.max_steps,
@@ -238,6 +240,10 @@ def main() -> None:
         seed=0,
     )
 
+    eos_token_ids = tokenizer.eos_token_id
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+
     worker = HarnessRolloutWorker(
         harness_session_factory=factory,
         harness_adapter=None,
@@ -256,6 +262,7 @@ def main() -> None:
         top_k=-1,
         log_completions=True,
         num_completions_to_print=2,
+        eos_token_ids=eos_token_ids
     )
 
     trainer = AsyncGRPOTrainer(

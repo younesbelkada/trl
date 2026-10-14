@@ -344,8 +344,9 @@ def prepare_tasks(args: argparse.Namespace, target: pathlib.Path) -> str:
     # {difficulty: how many to keep, None for all}
     quotas = {d: int(n) if n else None for d, _, n in (s.partition(":") for s in args.difficulty.split(",") if s)}
     if quotas:
-        # Read every task.toml from the cache, outside `target`: a folder holding only task.toml would count as a task.
-        tomls = snapshot_download(args.split, repo_type="dataset", allow_patterns=[f"{p}/task.toml" for p in names])
+        # Read every task.toml from a cache outside `target`: a folder holding only task.toml would count as a task.
+        tomls = snapshot_download(args.split, repo_type="dataset", allow_patterns=[f"{p}/task.toml" for p in names],
+                                  cache_dir=f"{target}-toml-cache")
         found = {p: re.search(r'^difficulty = "(\w+)"', pathlib.Path(tomls, p, "task.toml").read_text(), re.M) for p in names}
         picked = {d: [p for p in names if found[p] and found[p][1] == d][:n] for d, n in quotas.items()}
         names = sorted(p for selected in picked.values() for p in selected)
@@ -406,7 +407,8 @@ def main() -> None:
             raise RuntimeError("hf-sandbox cannot build a task's Dockerfile: pass --docker-image with a prebuilt image")
         patch_harbor_untar()
     if args.n_tasks and not os.path.isdir(args.split):
-        args.split = prepare_tasks(args, data_root / "tasks")
+        # Local disk, not the bucket: thousands of small files are slow to write there and slow for the server to read.
+        args.split = prepare_tasks(args, pathlib.Path("tasks").resolve())
     n_gpu = len(
         [
             line

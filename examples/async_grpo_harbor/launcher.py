@@ -73,7 +73,7 @@ Add a bucket so checkpoints and the model cache outlive the container, which is 
 ```sh
 hf jobs uv run --flavor h200x2 --image huggingface/trl \
     --secrets HF_TOKEN --secrets E2B_API_KEY --timeout 7200s \
-    --volume type=bucket,source=<user>/<bucket>,mount_path=/data \
+    --volume hf://buckets/<user>/<bucket>:/data \
     https://raw.githubusercontent.com/huggingface/trl/main/examples/async_grpo_harbor/launcher.py \
     -- --max-steps 20
 ```
@@ -87,7 +87,7 @@ only secret: the tasks download their data with it and HF sandboxes authenticate
 
 ```sh
 hf jobs uv run --flavor h200 --image huggingface/trl --secrets HF_TOKEN --timeout 12h \
-    --volume type=bucket,source=<user>/<bucket>,mount_path=/data \
+    --volume hf://buckets/<user>/<bucket>:/data \
     https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/launcher.py -- \
     --train-script-url https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/async_grpo_harbor.py \
     --model Qwen/Qwen3.5-0.8B --harness pi --split FineEnvs/SmolDataEnvs-harbor-train --n-tasks 1000 --difficulty easy \

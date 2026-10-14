@@ -395,7 +395,9 @@ def main() -> None:
         print(f"[launcher] WARNING {data_root} is not a directory, so no bucket is mounted: checkpoints", flush=True)
         print("[launcher] WARNING and the model cache will NOT survive this job.", flush=True)
         data_root = pathlib.Path("./out")
-    logs = data_root / "logs"
+    # One folder per job: jobs sharing a bucket would otherwise truncate each other's logs, including the server log
+    # each launcher reads its public proxy URL from.
+    logs = data_root / "logs" / (os.environ.get("JOB_ID") or os.environ.get("HF_JOB_ID") or "local")
     logs.mkdir(parents=True, exist_ok=True)
     if mounted:
         os.environ.setdefault("HF_HOME", str(data_root / "hf-cache"))

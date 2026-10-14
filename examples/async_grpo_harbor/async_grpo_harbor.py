@@ -135,9 +135,9 @@ def harbor_reward(outcome: HarnessRolloutOutcome) -> float | None:
 
 
 class IPCWeightTransfer:
-    """Push weights to a vLLM server on the trainer's own GPU through CUDA IPC, where NCCL refuses two ranks per device.
+    """Push weights to a vLLM server on the trainer's own GPU through CUDA IPC (NCCL refuses two ranks per device).
 
-    Implements the `weight_transfer` protocol of `AsyncGRPOTrainer`, which still merges a LoRA adapter before each send.
+    Implements the `weight_transfer` protocol of `AsyncGRPOTrainer`, which still merges a LoRA adapter before sending.
     The server needs `--weight-transfer-config '{"backend":"ipc"}'` and `VLLM_ALLOW_INSECURE_SERIALIZATION=1`: the
     IPC handles travel pickled over HTTP.
     """
@@ -214,6 +214,8 @@ def parse_args() -> argparse.Namespace:
     # `ipc` lets vLLM and the trainer share one GPU (see IPCWeightTransfer); `nccl` needs one GPU each.
     p.add_argument("--weight-transfer", choices=("nccl", "ipc"), default="nccl")
     p.add_argument("--token-budget", type=int, default=None, help="max tokens per packed row; bounds trainer memory")
+    # flash-attn3 (the default) needs Hopper; pass kernels-community/flash-attn2 on A10G, L40S or A100.
+    p.add_argument("--attn-implementation", default=None)
     p.add_argument("--save-steps", type=int, default=50)
     p.add_argument("--save-total-limit", type=int, default=3, help="0 keeps every checkpoint")
     p.add_argument("--output-dir", default=None)
@@ -276,6 +278,7 @@ def main() -> None:
         top_k=-1,
         max_staleness=args.max_staleness,
         token_budget=args.token_budget,
+        model_init_kwargs={"attn_implementation": args.attn_implementation} if args.attn_implementation else None,
         vllm_server_base_url=args.vllm_url,
         optim="adamw_torch",
         dtype="bfloat16",

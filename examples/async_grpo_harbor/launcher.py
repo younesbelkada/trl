@@ -19,6 +19,7 @@
 #     "openenv[harbor] @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
 #     "vllm>=0.22,<0.26",
 #     "datasets>=3.2",
+#     "peft",
 #     "trackio",
 #     "transformers>=5.2",
 #     "huggingface_hub>=1.22",
@@ -253,6 +254,8 @@ def warm_sandbox_template(args: argparse.Namespace, vllm_url: str, logs: pathlib
         "--sandbox", args.sandbox,
         "--task-index", "0",
         "-n", "1",
+        # Its own capture proxy; the default 8100 collides when several launchers share a host.
+        "--port", str(args.capture_port + 1),
     ]  # fmt: skip
     log = logs / "warm-template.log"
     print("[launcher] warming the sandbox template (one serial rollout) ...", flush=True)
@@ -279,6 +282,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     p.add_argument("--vllm-port", type=int, default=8000)
     p.add_argument("--vllm-device", default="0")
     p.add_argument("--train-device", default="1")  # the trainer; NCCL weight sync needs the same host
+    # `ipc` shares one GPU between vLLM and the trainer (same --vllm-device and --train-device); `nccl` needs two.
+    p.add_argument("--weight-transfer", choices=("nccl", "ipc"), default="nccl")
+    p.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM's share; lower it when colocated")
     p.add_argument("--max-model-len", type=int, default=131072)
     p.add_argument("--tool-call-parser", default="qwen3_xml")  # Qwen3.5; use `hermes` for most others
     p.add_argument("--reasoning-parser", default="qwen3")
@@ -322,10 +328,11 @@ def main() -> None:
             if line.strip()
         ]
     )
-    if n_gpu < 2:
-        raise RuntimeError(
-            f"needs 2 GPUs (engine + trainer on one host for NCCL) but sees {n_gpu}; try --flavor h200x2"
-        )
+    needed = len({args.vllm_device, args.train_device})
+    if n_gpu < needed:
+        raise RuntimeError(f"needs {needed} GPU(s) (engine + trainer on one host) but sees {n_gpu}; try --flavor h200x2")
+    if needed == 1 and args.weight_transfer != "ipc":
+        raise RuntimeError("vLLM and the trainer share a GPU, which NCCL cannot do: pass --weight-transfer ipc")
 
     # The pinned wheel omits harbor_env.harness; import it from the matching source checkout.
     source = data_root / f"openenv-{uuid.uuid4().hex}"
@@ -366,9 +373,14 @@ def main() -> None:
         "--default-chat-template-kwargs", '{"enable_thinking": false}',
         "--return-tokens-as-token-ids",
         "--logprobs-mode", "processed_logprobs",
-        "--weight-transfer-config", '{"backend":"nccl"}',
+        "--weight-transfer-config", f'{{"backend":"{args.weight_transfer}"}}',
     ]  # fmt: skip
-    proc = _spawn(vllm_cmd, vllm_log, env={"CUDA_VISIBLE_DEVICES": args.vllm_device, "VLLM_SERVER_DEV_MODE": "1"})
+    if args.gpu_memory_utilization is not None:
+        vllm_cmd += ["--gpu-memory-utilization", str(args.gpu_memory_utilization)]
+    vllm_env = {"CUDA_VISIBLE_DEVICES": args.vllm_device, "VLLM_SERVER_DEV_MODE": "1"}
+    if args.weight_transfer == "ipc":
+        vllm_env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"  # the IPC handles arrive pickled over HTTP
+    proc = _spawn(vllm_cmd, vllm_log, env=vllm_env)
     wait_for_vllm(vllm_url, proc, vllm_log)
 
     if not args.skip_warm:
@@ -392,6 +404,7 @@ def main() -> None:
         "--harness", args.harness,
         "--sandbox", args.sandbox,
         "--max-inflight", str(args.max_inflight),
+        "--weight-transfer", args.weight_transfer,
         "--run-name", run_name,
         "--output-dir", str(data_root / "runs" / run_name),
         *forwarded,

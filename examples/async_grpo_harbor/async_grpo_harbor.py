@@ -17,6 +17,7 @@
 #     "trl",
 #     "trackio",
 #     "datasets",
+#     "peft",
 #     "openenv @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
 # ]
 # ///
@@ -82,10 +83,12 @@ from functools import partial
 
 from datasets import Dataset
 from harbor_env.harness import HarborSessionFactory
+from peft import LoraConfig
 from transformers import AutoTokenizer
 
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
 from trl.experimental.async_grpo.openenv_harness import HarnessRolloutOutcome, HarnessRolloutWorker
+from trl.experimental.async_grpo.vllm_client import VLLMClient
 
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -131,6 +134,44 @@ def harbor_reward(outcome: HarnessRolloutOutcome) -> float | None:
     return reward
 
 
+class IPCWeightTransfer:
+    """Push weights to a vLLM server on the trainer's own GPU through CUDA IPC, where NCCL refuses two ranks per device.
+
+    Implements the `weight_transfer` protocol of `AsyncGRPOTrainer`, which still merges a LoRA adapter before each send.
+    The server needs `--weight-transfer-config '{"backend":"ipc"}'` and `VLLM_ALLOW_INSECURE_SERIALIZATION=1`: the
+    IPC handles travel pickled over HTTP.
+    """
+
+    def __init__(self, vllm_url: str):
+        self.vllm_url = vllm_url
+        self.vllm = VLLMClient(vllm_url)
+
+    def init_weight_transfer(self) -> None:
+        self.vllm.wait_for_server_ready()
+        self.vllm.init_weight_transfer_engine({})
+
+    def pause(self) -> None:
+        self.vllm.pause()
+
+    def send_weights(self, iterator) -> None:
+        from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerSendWeightsArgs, IPCWeightTransferEngine
+
+        self.vllm.start_weight_update()
+        try:
+            # Packed: weights are copied through bounded buffers, so the send needs little extra memory on a shared GPU.
+            IPCWeightTransferEngine.trainer_send_weights(
+                iterator, IPCTrainerSendWeightsArgs(send_mode="http", url=self.vllm_url, packed=True)
+            )
+        finally:
+            self.vllm.finish_weight_update()
+
+    def resume(self) -> None:
+        self.vllm.resume()
+
+    def destroy(self) -> None:
+        pass
+
+
 def task_indices(spec: str) -> list[int] | None:
     """Read comma-separated task indices, directly or from `@path` (safe for Slurm exports)."""
     spec = (spec or "").strip()
@@ -165,6 +206,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--agent-step-limit", type=int, default=12)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    # LoRA keeps vLLM on the merged-weight NCCL sync: the agents request the base model name, never an adapter name.
+    p.add_argument("--lora-r", type=int, default=0, help="train a LoRA adapter of this rank; 0 trains all weights")
+    p.add_argument("--lora-alpha", type=int, default=None, help="defaults to 2 * --lora-r")
+    # `ipc` lets vLLM and the trainer share one GPU (see IPCWeightTransfer); `nccl` needs one GPU each.
+    p.add_argument("--weight-transfer", choices=("nccl", "ipc"), default="nccl")
+    p.add_argument("--token-budget", type=int, default=None, help="max tokens per packed row; bounds trainer memory")
+    p.add_argument("--save-steps", type=int, default=50)
+    p.add_argument("--save-total-limit", type=int, default=3, help="0 keeps every checkpoint")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--project", default="async-grpo-harbor")
     p.add_argument("--trackio-space-id", default=None, help="host the trackio dashboard on a HF Space")
@@ -212,8 +261,8 @@ def main() -> None:
     config = AsyncGRPOConfig(
         output_dir=output_dir,
         save_strategy="steps",
-        save_steps=50,
-        save_total_limit=3,
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit or None,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_generations=args.num_generations,
@@ -224,6 +273,7 @@ def main() -> None:
         top_p=1.0,
         top_k=-1,
         max_staleness=args.max_staleness,
+        token_budget=args.token_budget,
         vllm_server_base_url=args.vllm_url,
         optim="adamw_torch",
         dtype="bfloat16",
@@ -265,12 +315,25 @@ def main() -> None:
         eos_token_ids=eos_token_ids
     )
 
+    peft_config = None
+    if args.lora_r:
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha or 2 * args.lora_r,
+            target_modules="all-linear",
+            # The agents send text only, so adapters on a vision tower would never train.
+            exclude_modules=r".*visual.*",
+            task_type="CAUSAL_LM",
+        )
+
     trainer = AsyncGRPOTrainer(
         model=args.model,
         args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
         rollout_worker=worker,
+        peft_config=peft_config,
+        weight_transfer=IPCWeightTransfer(args.vllm_url) if args.weight_transfer == "ipc" else None,
     )
     trainer.train()
     trainer.save_model()

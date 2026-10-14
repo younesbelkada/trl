@@ -105,6 +105,8 @@ hf jobs uv run --flavor h200 --image huggingface/trl --secrets HF_TOKEN --timeou
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -112,6 +114,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
@@ -407,8 +410,23 @@ def main() -> None:
             raise RuntimeError("hf-sandbox cannot build a task's Dockerfile: pass --docker-image with a prebuilt image")
         patch_harbor_untar()
     if args.n_tasks and not os.path.isdir(args.split):
-        # Local disk, not the bucket: thousands of small files are slow to write there and slow for the server to read.
-        args.split = prepare_tasks(args, pathlib.Path("tasks").resolve())
+        # Served from local disk: thousands of small files are slow to write to a bucket and slow for the server to read
+        # there. The bucket keeps one archive per task selection, so a relaunch unpacks it instead of preparing again.
+        target = pathlib.Path("tasks").resolve()
+        selection = [args.split, args.n_tasks, args.difficulty, args.docker_image, args.sandbox_memory_mb]
+        archive = data_root / f"tasks-{hashlib.sha1(json.dumps(selection).encode()).hexdigest()[:12]}.tar.gz"
+        if archive.exists():
+            with tarfile.open(archive) as tar:
+                tar.extractall(target, filter="data")
+            print(f"[launcher] unpacked the tasks prepared earlier from {archive}", flush=True)
+        else:
+            prepare_tasks(args, target)
+            partial = archive.with_name(archive.name + ".partial")
+            with tarfile.open(partial, "w:gz") as tar:
+                tar.add(target, arcname=".")
+            partial.rename(archive)  # a crash mid-write never leaves a truncated archive under the final name
+            print(f"[launcher] saved the prepared tasks to {archive}", flush=True)
+        args.split = str(target)
     n_gpu = len(
         [
             line

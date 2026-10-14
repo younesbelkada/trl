@@ -15,16 +15,31 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "trl @ git+https://github.com/huggingface/trl.git",
+#     "trl @ git+https://github.com/younesbelkada/trl.git@async-grpo-harbor-slurm",
 #     "openenv[harbor] @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
-#     "vllm>=0.22,<0.26",
+#     "vllm==0.25.1",
+#     "flashinfer-jit-cache==0.6.13",
+#     "kernels>=0.17.0,<0.18.0",
+#     "flash-linear-attention",
+#     "ray",
 #     "datasets>=3.2",
 #     "peft",
 #     "trackio",
 #     "transformers>=5.2",
 #     "huggingface_hub>=1.22",
 # ]
+#
+# [[tool.uv.index]]
+# name = "flashinfer"
+# url = "https://flashinfer.ai/whl/cu130"
+# explicit = true
+#
+# [tool.uv.sources]
+# flashinfer-jit-cache = { index = "flashinfer" }
 # ///
+# vllm 0.25.1 pins flashinfer 0.6.13, and the JIT cache must match it. vllm>=0.30 needs mcp>=2, which breaks the
+# fastmcp<4 the pinned OpenEnv imports. kernels 0.17.x is what transformers accepts for the flash-attn3 hub kernel,
+# flash-linear-attention gives Qwen3.5 its fast linear-attention path, and ray is imported by vLLM's IPC weight transfer.
 
 """Run `async_grpo_harbor.py` on Hugging Face Jobs: one job, one command.
 
@@ -65,6 +80,23 @@ hf jobs uv run --flavor h200x2 --image huggingface/trl \
 
 Anything after `--` is forwarded to the training script, so its full argument surface is available:
 `--model`, `--split`, `--harness`, `--sandbox`, `--max-steps`, and so on.
+
+One GPU, LoRA, HF sandboxes: vLLM and the trainer share the GPU (`--weight-transfer ipc`), each rollout runs in an HF
+sandbox job, and `--n-tasks`/`--difficulty` select the tasks (downloaded and patched at start-up). `HF_TOKEN` is the
+only secret: the tasks download their data with it and HF sandboxes authenticate with it. Hopper only (flash-attn3).
+
+```sh
+hf jobs uv run --flavor h200 --image huggingface/trl --secrets HF_TOKEN --timeout 12h \
+    --volume type=bucket,source=<user>/<bucket>,mount_path=/data \
+    https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/launcher.py -- \
+    --train-script-url https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/async_grpo_harbor.py \
+    --model Qwen/Qwen3.5-0.8B --harness pi --split FineEnvs/SmolDataEnvs-harbor-train --n-tasks 1000 --difficulty easy \
+    --sandbox hf-sandbox --docker-image docker.io/savatar101/env-data-agent-train:base \
+    --vllm-device 0 --train-device 0 --weight-transfer ipc --gpu-memory-utilization 0.3 --token-budget 65536 \
+    --max-inflight 32 --max-steps 200 --save-steps 25 --save-total-limit 0 --lora-r 32 --learning-rate 2e-5 \
+    --num-generations 8 --temperature 0.8 --max-completion-length 16384 --agent-step-limit 17 --agent-timeout 600 \
+    --per-device-train-batch-size 4 --gradient-accumulation-steps 4
+```
 """
 
 from __future__ import annotations
@@ -292,7 +324,57 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     p.add_argument("--data-root", default=str(DATA_ROOT))
     p.add_argument("--skip-warm", action="store_true")
     p.add_argument("--tunnel-check-s", type=float, default=60.0)  # 0 disables the supervisor
+    # With --n-tasks, a Hub --split is downloaded once into the data root (only the selected tasks), patched below, and
+    # served from local disk. --n-tasks is also forwarded to the training script.
+    p.add_argument("--n-tasks", type=int, default=None)
+    p.add_argument("--difficulty", default="", help="e.g. `easy`, `easy,medium` or `easy:33,medium:17`")
+    p.add_argument("--docker-image", default="", help="prebuilt task image, required by --sandbox hf-sandbox")
+    p.add_argument("--sandbox-memory-mb", type=int, default=4096)  # tasks ship 1024, too little for agents + pandas
     return p.parse_known_args()
+
+
+def prepare_tasks(args: argparse.Namespace, target: pathlib.Path) -> str:
+    """Download the first `--n-tasks` tasks of `--split` (filtered by `--difficulty`) and patch their task.toml."""
+    from huggingface_hub import HfApi, snapshot_download
+
+    names = sorted(e.path for e in HfApi().list_repo_tree(args.split, path_in_repo="tasks", repo_type="dataset"))
+    # {difficulty: how many to keep, None for all}
+    quotas = {d: int(n) if n else None for d, _, n in (s.partition(":") for s in args.difficulty.split(",") if s)}
+    if quotas:
+        # Read every task.toml from the cache, outside `target`: a folder holding only task.toml would count as a task.
+        tomls = snapshot_download(args.split, repo_type="dataset", allow_patterns=[f"{p}/task.toml" for p in names])
+        found = {p: re.search(r'^difficulty = "(\w+)"', pathlib.Path(tomls, p, "task.toml").read_text(), re.M) for p in names}
+        picked = {d: [p for p in names if found[p] and found[p][1] == d][:n] for d, n in quotas.items()}
+        names = sorted(p for selected in picked.values() for p in selected)
+        print("[launcher] selected " + ", ".join(f"{len(s)} {d}" for d, s in picked.items()), flush=True)
+    names = names[: args.n_tasks]
+    # local_dir writes real files: Harbor tars tests/ into the sandbox and HF cache symlinks would dangle.
+    snapshot_download(args.split, repo_type="dataset", allow_patterns=[f"{p}/**" for p in names], local_dir=target)
+    for p in names:
+        toml = target / p / "task.toml"
+        # The grader's LLM judge key is optional, but `${VAR}` makes Harbor require it on the host.
+        text = toml.read_text().replace('"${OPENAI_API_KEY}"', '"${OPENAI_API_KEY:-}"')
+        # OpenEnv passes no memory override to Harbor, so the sandbox size comes from task.toml.
+        text = re.sub(r"^memory_mb = .*$", f"memory_mb = {args.sandbox_memory_mb}", text, flags=re.M)
+        if args.docker_image and "docker_image" not in text:
+            text = re.sub(r"^\[environment\]$", f'[environment]\ndocker_image = "{args.docker_image}"', text, count=1, flags=re.M)
+        toml.write_text(text)
+    print(f"[launcher] prepared {len(names)} tasks in {target}", flush=True)
+    return str(target)
+
+
+def patch_harbor_untar() -> None:
+    """Make Harbor's remote untar skip restoring file owners, which HF sandboxes refuse (`Cannot change ownership`).
+
+    Harbor packs uploads with the host's uid and untars them as root, so every verifier upload fails there. Remove
+    once `remote_unpack_command` in harbor/environments/tar_transfer.py passes `--no-same-owner` upstream.
+    """
+    import harbor.environments.tar_transfer as tar_transfer
+
+    path = pathlib.Path(tar_transfer.__file__)
+    text = path.read_text()
+    if "--no-same-owner" not in text:
+        path.write_text(text.replace("tar -xzf ", "tar --no-same-owner -xzf "))
 
 
 def main() -> None:
@@ -316,6 +398,12 @@ def main() -> None:
             raise RuntimeError(f"`{tool}` is not on PATH; the PEP 723 dependencies did not install")
     if args.sandbox == "e2b" and not os.environ.get("E2B_API_KEY"):
         raise RuntimeError("sandbox is e2b but E2B_API_KEY is unset; pass it with --secrets E2B_API_KEY")
+    if args.sandbox == "hf-sandbox":
+        if not args.docker_image:
+            raise RuntimeError("hf-sandbox cannot build a task's Dockerfile: pass --docker-image with a prebuilt image")
+        patch_harbor_untar()
+    if args.n_tasks and not os.path.isdir(args.split):
+        args.split = prepare_tasks(args, data_root / "tasks")
     n_gpu = len(
         [
             line
@@ -405,6 +493,7 @@ def main() -> None:
         "--sandbox", args.sandbox,
         "--max-inflight", str(args.max_inflight),
         "--weight-transfer", args.weight_transfer,
+        *(["--n-tasks", str(args.n_tasks)] if args.n_tasks else []),
         "--run-name", run_name,
         "--output-dir", str(data_root / "runs" / run_name),
         *forwarded,

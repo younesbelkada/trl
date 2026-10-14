@@ -1076,12 +1076,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_revision = model_init_kwargs.get("revision")
         # FlashAttention is required: training runs in padding-free mode, where sequences are concatenated into a
         # single row and `cu_seq_lens` are derived from `position_ids` resets. SDPA/eager can't handle this.
-        model = create_model_from_path(
-            model,
-            device_map=None,
-            attn_implementation="kernels-community/flash-attn3",
-            **model_init_kwargs,
-        )
+        # FlashAttention 3 needs Hopper: on Ampere/Ada GPUs, pass
+        # `model_init_kwargs={"attn_implementation": "kernels-community/flash-attn2"}`.
+        model_init_kwargs.setdefault("attn_implementation", "kernels-community/flash-attn3")
+        model = create_model_from_path(model, device_map=None, **model_init_kwargs)
 
         if args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")

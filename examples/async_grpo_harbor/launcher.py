@@ -401,8 +401,9 @@ def main() -> None:
     logs.mkdir(parents=True, exist_ok=True)
     if mounted:
         # HF_HOME stays on local disk: gradio downloads its tunnel binary there and must execute it, which a mounted
-        # bucket does not allow. Only the trackio database goes to the bucket, next to the checkpoints and logs.
-        os.environ.setdefault("TRACKIO_DIR", str(data_root / "trackio"))
+        # bucket does not allow. Only the trackio database goes to the bucket, one per job like the logs: jobs writing
+        # one SQLite file over the mount at the same time lose rows.
+        os.environ.setdefault("TRACKIO_DIR", str(data_root / "trackio" / logs.name))
 
     for tool in ("openenv", "vllm", "git"):
         if shutil.which(tool) is None:

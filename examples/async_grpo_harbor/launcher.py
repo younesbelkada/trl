@@ -68,7 +68,7 @@ hf jobs uv run \
     https://raw.githubusercontent.com/huggingface/trl/main/examples/async_grpo_harbor/launcher.py
 ```
 
-Add a bucket so checkpoints and the model cache outlive the container, which is otherwise ephemeral:
+Add a bucket so checkpoints, logs and the trackio database outlive the container, which is otherwise ephemeral:
 
 ```sh
 hf jobs uv run --flavor h200x2 --image huggingface/trl \
@@ -393,14 +393,16 @@ def main() -> None:
     mounted = data_root.is_dir()
     if not mounted:
         print(f"[launcher] WARNING {data_root} is not a directory, so no bucket is mounted: checkpoints", flush=True)
-        print("[launcher] WARNING and the model cache will NOT survive this job.", flush=True)
+        print("[launcher] WARNING and logs will NOT survive this job.", flush=True)
         data_root = pathlib.Path("./out")
     # One folder per job: jobs sharing a bucket would otherwise truncate each other's logs, including the server log
     # each launcher reads its public proxy URL from.
     logs = data_root / "logs" / (os.environ.get("JOB_ID") or os.environ.get("HF_JOB_ID") or "local")
     logs.mkdir(parents=True, exist_ok=True)
     if mounted:
-        os.environ.setdefault("HF_HOME", str(data_root / "hf-cache"))
+        # HF_HOME stays on local disk: gradio downloads its tunnel binary there and must execute it, which a mounted
+        # bucket does not allow. Only the trackio database goes to the bucket, next to the checkpoints and logs.
+        os.environ.setdefault("TRACKIO_DIR", str(data_root / "trackio"))
 
     for tool in ("openenv", "vllm", "git"):
         if shutil.which(tool) is None:

@@ -158,9 +158,11 @@ class IPCWeightTransfer:
 
         self.vllm.start_weight_update()
         try:
-            # Packed: weights are copied through bounded buffers, so the send needs little extra memory on a shared GPU.
+            # Unpacked: vLLM reads the parameters' own storage, so a sync allocates nothing. The packed mode copies
+            # into fresh buffers every sync, and CUDA IPC keeps them alive until the server releases them; a packed
+            # run ran out of memory after ~80 steps with the trainer holding ~90 GB.
             IPCWeightTransferEngine.trainer_send_weights(
-                iterator, IPCTrainerSendWeightsArgs(send_mode="http", url=self.vllm_url, packed=True)
+                iterator, IPCTrainerSendWeightsArgs(send_mode="http", url=self.vllm_url, packed=False)
             )
         finally:
             self.vllm.finish_weight_update()

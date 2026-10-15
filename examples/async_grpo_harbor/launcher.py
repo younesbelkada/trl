@@ -399,10 +399,14 @@ def run_eval(args: argparse.Namespace, data_root: pathlib.Path, env_path: str, f
             else:
                 wait_for_public_proxy(server_log, args.capture_port)
                 cmd = [*common, "--server", f"http://127.0.0.1:{args.server_port}", "--harnesses", args.eval_harnesses]
+            # Into eval.log and the job log both, so progress shows up while a policy is evaluated, not only at its end.
             with open(out / "eval.log", "w") as log:
                 env = {**os.environ, "PYTHONPATH": env_path}
-                rc |= subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
-            print((out / "eval.log").read_text().rsplit("\n\n", 1)[-1], flush=True)  # the summary table
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
+                for line in proc.stdout:
+                    log.write(line)
+                    print(line, end="", flush=True)
+                rc |= proc.wait()
         finally:
             for proc in procs:
                 _stop_process(proc)

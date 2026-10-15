@@ -90,13 +90,14 @@ only secret: the tasks download their data with it and HF sandboxes authenticate
 ```sh
 hf jobs uv run --flavor h200 --image huggingface/trl --secrets HF_TOKEN --timeout 12h \
     --volume hf://buckets/<user>/<bucket>:/outputs \
-    https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/launcher.py -- \
+    https://raw.githubusercontent.com/huggingface/trl/main/examples/async_grpo_harbor/launcher.py -- \
     --data-root /outputs \
-    --train-script-url https://raw.githubusercontent.com/<user>/trl/<branch>/examples/async_grpo_harbor/async_grpo_harbor.py \
+    --train-script-url https://raw.githubusercontent.com/huggingface/trl/main/examples/async_grpo_harbor/async_grpo_harbor.py \
     --model Qwen/Qwen3.5-0.8B --harness pi --split FineEnvs/SmolDataEnvs-harbor-train --n-tasks 1000 --difficulty easy \
     --sandbox hf-sandbox --docker-image docker.io/savatar101/env-data-agent-train:base \
     --vllm-device 0 --train-device 0 --weight-transfer ipc --gpu-memory-utilization 0.3 --token-budget 65536 \
     --max-inflight 32 --max-steps 200 --save-steps 25 --save-total-limit 0 --lora-r 32 --learning-rate 2e-5 \
+    --attn-implementation kernels-community/flash-attn3 \
     --num-generations 8 --temperature 0.8 --max-completion-length 16384 --agent-step-limit 17 --agent-timeout 600 \
     --per-device-train-batch-size 4 --gradient-accumulation-steps 4
 ```

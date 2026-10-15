@@ -39,7 +39,12 @@ import requests
 from async_grpo_ipython import IPythonEnv, system_prompt
 from transformers import AutoTokenizer
 
-from trl.chat_template_utils import get_training_chat_template, is_chat_template_prefix_preserving, parse_response
+from trl.chat_template_utils import (
+    add_response_schema,
+    get_training_chat_template,
+    is_chat_template_prefix_preserving,
+    parse_response,
+)
 from trl.experimental.harbor import HarborSpec
 
 
@@ -174,7 +179,8 @@ def main() -> None:
     spec = HarborSpec(args.split, agent=IPythonEnv, environment_type=args.sandbox, num_tasks=args.n_tasks)
     rows = list(spec.train_dataset)
     system = {"role": "system", "content": system_prompt(args.task_python, magics=not args.no_magics_prompt)}
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # As the rollout worker: the response template that lets `parse_response` read tool calls.
+    tokenizer = add_response_schema(AutoTokenizer.from_pretrained(args.model))
     # The rollout worker's choice: a training-safe template when the tokenizer's own is not prefix-preserving.
     chat_template = None if is_chat_template_prefix_preserving(tokenizer) else get_training_chat_template(tokenizer)
     max_model_len = requests.get(f"{args.vllm_url}/v1/models").json()["data"][0]["max_model_len"]
@@ -201,7 +207,8 @@ def main() -> None:
             record = {"task_name": task, "task_index": row["task_index"], "harness": "ipython",
                       "difficulty": difficulty(args.split, task), **result}
             pair_path(row).write_text(json.dumps(record, indent=2))
-            print(f"[{done}/{len(pending)}] {task}  reward={result.get('reward')}", flush=True)
+            error = f"  error={result['error'][:300]}" if "error" in result else ""
+            print(f"[{done}/{len(pending)}] {task}  reward={result.get('reward')}{error}", flush=True)
 
     records = [json.loads(pair_path(row).read_text()) for row in rows if pair_path(row).exists()]
     summary = {

@@ -535,10 +535,11 @@ def main() -> None:
             if line.strip()
         ]
     )
-    needed = len({args.vllm_device, args.train_device})
+    # Evaluation serves the policy only; training also runs the trainer, on its own GPU unless colocated.
+    needed = 1 if args.eval_checkpoints else len({args.vllm_device, args.train_device})
     if n_gpu < needed:
         raise RuntimeError(f"needs {needed} GPU(s) (engine + trainer on one host) but sees {n_gpu}; try --flavor h200x2")
-    if needed == 1 and args.weight_transfer != "ipc":
+    if not args.eval_checkpoints and needed == 1 and args.weight_transfer != "ipc":
         raise RuntimeError("vLLM and the trainer share a GPU, which NCCL cannot do: pass --weight-transfer ipc")
 
     # The pinned wheel omits harbor_env.harness; import it from the matching source checkout.

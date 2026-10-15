@@ -400,6 +400,7 @@ class _AsyncRolloutLoop:
         self.num_completions_to_print = num_completions_to_print
         self._fork_threshold_tokens = fork_threshold_tokens  # reconciler fork/realign threshold
         self.vllm_server_url = vllm_server_url.rstrip("/")
+        self.max_model_len = None  # vLLM's cap on prompt + completion, read from the server when the loops start
 
         tools = tools or []
         self._standalone_tools = tools  # tools that are not bound to an environment
@@ -517,6 +518,13 @@ class _AsyncRolloutLoop:
     async def _run_loops(self, stop_event: asyncio.Event) -> None:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=self.max_inflight_tasks)) as session:
             self.session = session
+
+            async def _get_max_model_len():
+                async with session.get(f"{self.vllm_server_url}/v1/models") as response:
+                    response.raise_for_status()
+                    return (await response.json())["data"][0]["max_model_len"]
+
+            self.max_model_len = await self._retry(_get_max_model_len, label="GET /v1/models")
             logger.info(
                 f"vllm worker started: num_generations={self.num_generations}, "
                 f"max_inflight_tasks={self.max_inflight_tasks}, temperature={self.temperature}, "
@@ -925,6 +933,11 @@ class _AsyncRolloutLoop:
                 chat_template=self.chat_template,
                 **self.chat_template_kwargs,
             )
+            if self.max_model_len is not None and len(prompt_ids) >= self.max_model_len:
+                # The conversation fills vLLM's context window: there is no room for another turn, and vLLM would
+                # reject the request (400) on every retry, failing the run. End the rollout here instead.
+                self._counters["rollout/context_full_total"] += 1
+                break
             turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
             assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids)
             completion.append(assistant_message)
@@ -1003,7 +1016,10 @@ class _AsyncRolloutLoop:
         payload = {
             "model": self._request_model,
             "prompt": prompt_ids,
-            "max_tokens": self.max_tokens,
+            # Never more than still fits in the context window: vLLM rejects a prompt + max_tokens over max_model_len.
+            "max_tokens": self.max_tokens
+            if self.max_model_len is None
+            else min(self.max_tokens, self.max_model_len - len(prompt_ids)),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
@@ -1133,7 +1149,15 @@ class _AsyncRolloutLoop:
             async with self.session.post(
                 f"{self.vllm_server_url}{path}", json=payload, timeout=client_timeout
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    # Keep vLLM's reason (e.g. a prompt over max_model_len): `raise_for_status` drops it.
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=response.status,
+                        message=(await response.text())[:500],
+                        headers=response.headers,
+                    )
                 content = await response.json()
                 return content if content else {}
 

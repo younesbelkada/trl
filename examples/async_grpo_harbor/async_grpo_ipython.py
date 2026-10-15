@@ -155,6 +155,13 @@ class IPythonEnv(HarborEnv):
     Defined in the training script so the async rollout worker, a spawned process, can unpickle its factory.
     """
 
+    def reset(self, task_dir: str | None = None, **kwargs) -> str:
+        started = time.monotonic()
+        instruction = super().reset(task_dir, **kwargs)
+        # One line per rollout in the job logs: the sandbox start and kernel install are most of a rollout's wait.
+        print(f"[ipython] {Path(task_dir).name}: sandbox ready in {time.monotonic() - started:.0f}s", flush=True)
+        return instruction
+
     async def _shell(self, command: str, timeout: int | None = None, user: str | None = None) -> tuple[str, str, int]:
         result = await self._env.exec(command, timeout_sec=timeout, user=user)
         return result.stdout or "", result.stderr or "", result.return_code

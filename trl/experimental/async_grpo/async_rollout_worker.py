@@ -554,43 +554,11 @@ class _AsyncRolloutLoop:
                         )
                     tools = self._env_tools[name] if self.environment_factories is not None else self.tools
                     # Draw a reusable environment instance for this rollout (creating one only if the pool is
-                    # exhausted); it is returned to the pool when the task completes. Reset it BEFORE building the
-                    # prompt and capture its initial observation (e.g. a task instruction). The reset() return was
-                    # previously discarded, so an environment_factory whose task lives in the observation (not the
-                    # dataset prompt) was generated against the bare prompt. Mirror GRPOTrainer: fold the observation
-                    # into the last prompt message. reset() may be stochastic, so this is done per generation (each
-                    # generation gets its own observation -> its own prompt and prompt_ids). `environment` is a control
-                    # field in multi-environment mode, so it is not forwarded to `reset`.
+                    # exhausted); it is returned to the pool when the task completes, and reset by the task itself.
                     environment = None
-                    observation = None
                     if self.environment_factories is not None:
                         pool = self._environment_pool[name]
                         environment = pool.pop() if pool else self.environment_factories[name]()
-                        reset_kwargs = (
-                            {k: v for k, v in row.items() if k != "environment"} if self._multi_environment else row
-                        )
-                        # Off the event loop, like tool calls: a reset can take seconds (e.g. starting a sandbox), and
-                        # blocking here would stall inflight rollouts and the heartbeat.
-                        observation = await asyncio.get_running_loop().run_in_executor(
-                            self._tool_pool, functools.partial(environment.reset, **reset_kwargs)
-                        )
-                    # `prompt` is optional only when an environment owns the data; `reset()` then supplies it. Without
-                    # an environment, a missing `prompt` is a malformed dataset and must still fail fast (KeyError).
-                    if "prompt" not in row and self.environment_factories is not None:
-                        prompt = [{"role": "user", "content": ""}]
-                    else:
-                        prompt = row["prompt"]
-                    if observation is not None:
-                        # Rebuild the last message instead of mutating in place (as GRPOTrainer does): the
-                        # same row is reused across the group's generations and across epochs. Normalize str vs
-                        # list (multimodal) content the same way GRPOTrainer does before concatenating.
-                        last = prompt[-1]
-                        content = last["content"]
-                        if isinstance(observation, list) and isinstance(content, str):
-                            content = [{"type": "text", "text": content}]
-                        if isinstance(observation, str) and isinstance(content, list):
-                            observation = [{"type": "text", "text": observation}]
-                        prompt = prompt[:-1] + [{**last, "content": content + observation}]
 
                     # Build this rollout's tool dict: the standalone tools plus the methods of its environment.
                     methods = []
@@ -624,9 +592,9 @@ class _AsyncRolloutLoop:
                         pending_completed[group_id] = 0
 
                     task = asyncio.create_task(
-                        self._generate_one(prompt, tool_dict=tool_dict, tools=tools, group_id=group_id)
+                        self._reset_and_generate(environment, row, tool_dict=tool_dict, tools=tools, group_id=group_id)
                     )
-                    inflight_tasks[task] = (group_id, slot, name, environment, prompt)
+                    inflight_tasks[task] = (group_id, slot, name, environment)
 
                 self._inflight = len(inflight_tasks)  # gauge, reported by the score loop's push
                 if not inflight_tasks:
@@ -640,12 +608,12 @@ class _AsyncRolloutLoop:
                     continue
 
                 for task in done:
-                    group_id, slot, name, environment, prompt = inflight_tasks.pop(task)
+                    group_id, slot, name, environment = inflight_tasks.pop(task)
                     free_slots.add(slot)
                     if task.exception() is not None:
                         raise task.exception()
 
-                    (
+                    prompt, (
                         completion,
                         completion_ids,
                         sequences,
@@ -873,6 +841,46 @@ class _AsyncRolloutLoop:
             for _ in range(self.num_generations):
                 yield group_id, row
             group_id += 1
+
+    async def _reset_and_generate(
+        self, environment, row: dict, tool_dict: dict[str, Callable], tools: list[Callable], group_id: int
+    ) -> tuple[Messages, tuple[list[dict[str, str]], list[int], list[TrainingSequence], int, int, float | None]]:
+        """Reset the rollout's environment, fold its observation into the prompt, and roll out from that prompt.
+
+        Runs inside the rollout's task, so resets that take seconds (e.g. starting a sandbox) overlap with each other
+        and with inflight generation instead of filling the slots one at a time. Returns `(prompt, <_generate_one's>)`.
+        """
+        # Reset BEFORE building the prompt and capture its initial observation (e.g. a task instruction). The reset()
+        # return was previously discarded, so an environment_factory whose task lives in the observation (not the
+        # dataset prompt) was generated against the bare prompt. Mirror GRPOTrainer: fold the observation into the last
+        # prompt message. reset() may be stochastic, so this is done per generation (each generation gets its own
+        # observation -> its own prompt and prompt_ids). `environment` is a control field in multi-environment mode, so
+        # it is not forwarded to `reset`.
+        observation = None
+        if environment is not None:
+            reset_kwargs = {k: v for k, v in row.items() if k != "environment"} if self._multi_environment else row
+            # Off the event loop, like tool calls: blocking here would stall inflight rollouts and the heartbeat.
+            observation = await asyncio.get_running_loop().run_in_executor(
+                self._tool_pool, functools.partial(environment.reset, **reset_kwargs)
+            )
+        # `prompt` is optional only when an environment owns the data; `reset()` then supplies it. Without an
+        # environment, a missing `prompt` is a malformed dataset and must still fail fast (KeyError).
+        if "prompt" not in row and environment is not None:
+            prompt = [{"role": "user", "content": ""}]
+        else:
+            prompt = row["prompt"]
+        if observation is not None:
+            # Rebuild the last message instead of mutating in place (as GRPOTrainer does): the same row is reused
+            # across the group's generations and across epochs. Normalize str vs list (multimodal) content the same
+            # way GRPOTrainer does before concatenating.
+            last = prompt[-1]
+            content = last["content"]
+            if isinstance(observation, list) and isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            if isinstance(observation, str) and isinstance(content, list):
+                observation = [{"type": "text", "text": observation}]
+            prompt = prompt[:-1] + [{**last, "content": content + observation}]
+        return prompt, await self._generate_one(prompt, tool_dict=tool_dict, tools=tools, group_id=group_id)
 
     async def _generate_one(
         self, prompt: Messages, tool_dict: dict[str, Callable], tools: list[Callable], group_id: int = 0

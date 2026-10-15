@@ -32,7 +32,8 @@ verifier is the reward.
 
 The training loop is TRL's, not ipyh's: a reply without a tool call ends the rollout, and ipyh's nudges (on an empty or
 truncated reply) are not sent. The tool, its schema, the system prompt and the output handling are ipyh's, so a model
-trained here is evaluated with ipyh on the same interface.
+trained here is evaluated with ipyh on the same interface. One addition: a short guide to IPython magics after ipyh's
+system prompt (`MAGICS_PROMPT`), so evaluate with the same text appended.
 
 Run (2 GPUs: vLLM on one, trainer on the other; tasks prepared as in smoke_local.sh, `--split` a local task dir):
 
@@ -143,6 +144,16 @@ KERNEL_LAUNCH = (
     f"for i in $(seq 120); do [ -s {KERNEL_RUN}/kernel.json ] && exit 0; sleep 1; done; "
     f"cat {KERNEL_RUN}/kernel.log; exit 1"
 )
+
+
+# Appended to ipyh's system prompt. The model called magics as tools (`writefile`, `run`, `install`, `execute`): they
+# are cell syntax. https://ipython.readthedocs.io/en/stable/interactive/magics.html
+MAGICS_PROMPT = """IPython magics go inside `ipython` cells; they are not tools:
+- `!cmd` runs a shell command; `files = !ls` captures its output lines.
+- `%%bash` as a cell's first line runs the whole cell in bash.
+- `%%writefile <path>` as a cell's first line writes the rest of the cell to that file (`-a` appends).
+- `%cd <dir>` changes the working directory for later cells (`!cd` does not persist).
+- `%run <file.py>` runs a Python script in the kernel."""
 
 
 def write_file_command(path: str, content: str) -> str:
@@ -325,6 +336,7 @@ def main() -> None:
     spec = HarborSpec(args.split, agent=IPythonEnv, environment_type=args.sandbox, num_tasks=args.n_tasks)
     # ipyh's system prompt goes first; TRL appends the task instruction (from `reset`) to the empty user message.
     system_prompt = DEFAULT_SYSTEM_PROMPT.format(python=TASK_PYTHON.format(path=args.task_python))
+    system_prompt += "\n\n" + MAGICS_PROMPT
     system = {"role": "system", "content": system_prompt}
     dataset = spec.train_dataset.map(lambda row: {"prompt": [system, *row["prompt"]]})
     print(f"tasks {len(dataset)} from {args.split} on {args.sandbox}; output {output_dir}")

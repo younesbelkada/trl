@@ -539,6 +539,8 @@ class _AsyncRolloutLoop:
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
         pending_groups: dict[int, RolloutGroup] = {}
         pending_completed: dict[int, int] = {}
+        failed_groups: set[int] = set()  # groups with a failed rollout, dropped once all their rollouts are done
+        failures_in_a_row = 0
         inflight_tasks: dict[asyncio.Task, tuple[int, int, Any, object, Messages]] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
@@ -618,36 +620,52 @@ class _AsyncRolloutLoop:
                 for task in done:
                     group_id, slot, name, environment = inflight_tasks.pop(task)
                     free_slots.add(slot)
-                    if task.exception() is not None:
-                        raise task.exception()
-
-                    prompt, env_reward, (
-                        completion,
-                        completion_ids,
-                        sequences,
-                        tool_call_count,
-                        tool_failure_count,
-                        rollout_reward,
-                    ) = task.result()
-                    group = pending_groups[group_id]
-                    group.prompts.append(prompt)
-                    group.completions.append(completion)
-                    group.completions_ids.append(completion_ids)
-                    group.completions_sequences.append(sequences)
-                    group.tool_call_counts.append(tool_call_count)
-                    group.tool_failure_counts.append(tool_failure_count)
-                    group.rollout_rewards.append(rollout_reward)
-                    # Record `(env class, reward)` (scored in the rollout's task) so `_score_group` can place it in the
-                    # matching env's reward column; rollouts whose env owns no reward record `None` (turned into NaN
-                    # and ignored) to stay aligned with the group's other per-rollout lists.
-                    if self._env_reward_types:
-                        group.env_rewards.append(env_reward)
-                    if environment is not None:
-                        self._environment_pool[name].append(environment)
-                    self._total_completion_tokens += len(completion_ids)
                     pending_completed[group_id] += 1
+                    error = task.exception()
+                    if error is not None:
+                        # A failed rollout (e.g. its sandbox died) drops its group, not the run: scoring it 0 would
+                        # train on an infrastructure failure. Its environment is not returned to the pool, as it may be
+                        # broken. Only a streak as long as the inflight limit, as from a broken environment or a down
+                        # server, stops the worker: dropping every group would otherwise starve the trainer silently.
+                        failures_in_a_row += 1
+                        if failures_in_a_row >= self.max_inflight_tasks:
+                            raise error
+                        logger.warning(f"Rollout failed, dropping its group: {type(error).__name__}: {error}")
+                        self._counters["rollout/failed_total"] += 1
+                        failed_groups.add(group_id)
+                    else:
+                        failures_in_a_row = 0
+                        prompt, env_reward, (
+                            completion,
+                            completion_ids,
+                            sequences,
+                            tool_call_count,
+                            tool_failure_count,
+                            rollout_reward,
+                        ) = task.result()
+                        group = pending_groups[group_id]
+                        group.prompts.append(prompt)
+                        group.completions.append(completion)
+                        group.completions_ids.append(completion_ids)
+                        group.completions_sequences.append(sequences)
+                        group.tool_call_counts.append(tool_call_count)
+                        group.tool_failure_counts.append(tool_failure_count)
+                        group.rollout_rewards.append(rollout_reward)
+                        # Record `(env class, reward)` (scored in the rollout's task) so `_score_group` can place it in
+                        # the matching env's reward column; rollouts whose env owns no reward record `None` (turned
+                        # into NaN and ignored) to stay aligned with the group's other per-rollout lists.
+                        if self._env_reward_types:
+                            group.env_rewards.append(env_reward)
+                        if environment is not None:
+                            self._environment_pool[name].append(environment)
+                        self._total_completion_tokens += len(completion_ids)
 
-                    if pending_completed[group_id] == self.num_generations:
+                    if pending_completed[group_id] == self.num_generations and group_id in failed_groups:
+                        failed_groups.discard(group_id)
+                        del pending_groups[group_id]
+                        del pending_completed[group_id]
+                    elif pending_completed[group_id] == self.num_generations:
+                        group = pending_groups[group_id]
                         group.queued_at = time.monotonic()
                         t_blocked = None
                         while True:

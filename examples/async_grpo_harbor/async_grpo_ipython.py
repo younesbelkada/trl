@@ -373,7 +373,9 @@ def main() -> None:
         project=args.project,
         trackio_space_id=args.trackio_space_id,
         run_name=run_name,
-        log_completions=True,
+        # No rollout table in the job log: every group printed in full made ~780k lines in 27 minutes and buried the
+        # error that ended the run. Completions still reach Trackio as traces.
+        log_completions=False,
         logging_steps=1,
         seed=0,
     )

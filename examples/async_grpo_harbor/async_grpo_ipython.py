@@ -301,6 +301,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-tasks", type=int, default=None)
     # The interpreter named in ipyh's system prompt; SmolDataEnvs images ship it here.
     p.add_argument("--task-python", default="/usr/local/bin/python3")
+    p.add_argument("--no-magics-prompt", action="store_true", help="ipyh's system prompt alone, without MAGICS_PROMPT")
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--max-inflight", type=int, default=32)
     p.add_argument("--max-completion-length", type=int, default=8192, help="tokens per model turn")
@@ -336,7 +337,8 @@ def main() -> None:
     spec = HarborSpec(args.split, agent=IPythonEnv, environment_type=args.sandbox, num_tasks=args.n_tasks)
     # ipyh's system prompt goes first; TRL appends the task instruction (from `reset`) to the empty user message.
     system_prompt = DEFAULT_SYSTEM_PROMPT.format(python=TASK_PYTHON.format(path=args.task_python))
-    system_prompt += "\n\n" + MAGICS_PROMPT
+    if not args.no_magics_prompt:
+        system_prompt += "\n\n" + MAGICS_PROMPT
     system = {"role": "system", "content": system_prompt}
     dataset = spec.train_dataset.map(lambda row: {"prompt": [system, *row["prompt"]]})
     print(f"tasks {len(dataset)} from {args.split} on {args.sandbox}; output {output_dir}")

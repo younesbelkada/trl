@@ -158,14 +158,19 @@ class IPythonEnv(HarborEnv):
     def reset(self, task_dir: str | None = None, **kwargs) -> str:
         started = time.monotonic()
         instruction = super().reset(task_dir, **kwargs)
+        self._task_name = Path(task_dir).name
         # One line per rollout in the job logs: the sandbox start and kernel install are most of a rollout's wait.
-        print(f"[ipython] {Path(task_dir).name}: sandbox ready in {time.monotonic() - started:.0f}s", flush=True)
+        print(f"[ipython] {self._task_name}: sandbox ready in {time.monotonic() - started:.0f}s", flush=True)
         return instruction
 
     def get_reward(self) -> float:
         # AsyncGRPO scores an environment through `get_reward`: `HarborSpec.reward_funcs` reads `environments=`, which
         # only `GRPOTrainer` passes. The verifier's scalar, as `HarborEnv.reward` computes it.
-        return self.reward
+        # The submission next to its reward in the job logs, so a reward of 0 reads as no answer or a wrong one.
+        answer = self._run(self._shell("cat /workdir/answer.txt 2>&1 | head -c 200"))[0]
+        reward = self.reward
+        print(f"[ipython] {self._task_name}: reward {reward} for answer {answer!r}", flush=True)
+        return reward
 
     async def _shell(self, command: str, timeout: int | None = None, user: str | None = None) -> tuple[str, str, int]:
         result = await self._env.exec(command, timeout_sec=timeout, user=user)

@@ -29,6 +29,7 @@ The summary has the layout of `evaluate_harbor.py`'s, with one harness: `ipython
 
 import argparse
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,9 +44,28 @@ from trl.experimental.harbor import HarborSpec
 
 
 def run_task(args, tokenizer, chat_template, max_model_len, env_factory, system, row) -> dict:
-    """One rollout of one task, as TRL's rollout worker runs it; returns its grade and counts."""
+    """One rollout of one task; its result, or `reward: None` and the error. Its sandbox is stopped either way.
+
+    Nothing escapes and the sandbox is stopped here because an environment still alive at interpreter exit hangs it:
+    `HarborEnv.__del__` waits on the environment's event-loop thread, which shutdown has already stopped. A raised
+    error would keep the environment alive through its traceback (the run's first eval never exited).
+    """
     start = time.monotonic()
     env = env_factory()
+    try:
+        return {**rollout(args, tokenizer, chat_template, max_model_len, env, system, row),
+                "elapsed_s": round(time.monotonic() - start, 1)}  # fmt: skip
+    except Exception as exc:  # noqa: BLE001 - recorded in the task's result, the other tasks go on
+        return {"reward": None, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            env._run(env._stop())
+        except Exception as exc:  # noqa: BLE001 - a sandbox that will not stop must not fail the eval
+            print(f"could not stop the sandbox of {Path(row['task_dir']).name}: {exc}", flush=True)
+
+
+def rollout(args, tokenizer, chat_template, max_model_len, env, system, row) -> dict:
+    """One rollout of one task, as TRL's rollout worker runs it; returns its grade and counts."""
     messages = [system, {"role": "user", "content": env.reset(task_dir=row["task_dir"])}]
     tool_calls = model_calls = generated_tokens = tool_turns = 0
     while True:
@@ -96,7 +116,6 @@ def run_task(args, tokenizer, chat_template, max_model_len, env_factory, system,
         "model_calls": model_calls,
         "tool_calls": tool_calls,
         "generated_tokens": generated_tokens,
-        "elapsed_s": round(time.monotonic() - start, 1),
     }
 
 
@@ -202,8 +221,11 @@ def main() -> None:
     for name, s in [*summary["harnesses"].items(), ("overall", summary["overall"])]:
         pass_at_1 = f"{s['pass_at_1']:.3f}" if s["pass_at_1"] is not None else "n/a"
         tools = f"{s['mean_tool_calls']:.1f}" if s["mean_tool_calls"] is not None else "n/a"
-        print(f"{name:16s} {pass_at_1:>7s} {s['coverage']:>9.2f} {tools:>11s}")
+        print(f"{name:16s} {pass_at_1:>7s} {s['coverage']:>9.2f} {tools:>11s}", flush=True)
 
 
 if __name__ == "__main__":
     main()
+    # Every sandbox is already stopped (`run_task`) and the results are on disk: skip the interpreter's teardown, where
+    # a background thread of the sandbox client can keep the process alive and stall the launcher's next policy.
+    os._exit(0)

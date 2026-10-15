@@ -15,7 +15,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "trl @ git+https://github.com/younesbelkada/trl.git@async-grpo-ipython",
+#     "trl @ git+https://github.com/younesbelkada/trl.git@async-grop-ipython",
 #     "openenv[harbor] @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
 #     "vllm==0.25.1",
 #     "flashinfer-jit-cache==0.6.13",
@@ -603,7 +603,7 @@ def main() -> None:
     if not args.skip_warm and not args.in_process_harbor:
         warm_sandbox_template(args, vllm_url, logs)
 
-    script = pathlib.Path("async_grpo_harbor.py")
+    script = pathlib.Path(args.train_script_url.rsplit("/", 1)[-1])
     print(f"[launcher] fetching {args.train_script_url}", flush=True)
     try:
         urllib.request.urlretrieve(args.train_script_url, script)
@@ -611,7 +611,8 @@ def main() -> None:
         raise RuntimeError(f"could not download the training script from {args.train_script_url}: {exc}") from exc
 
     stamp = os.environ.get("HF_JOB_ID") or os.environ.get("JOB_ID") or "local"
-    run_name = f"{args.model.split('/')[-1]}-{args.harness}-{stamp}-{uuid.uuid4().hex[:8]}"
+    harness = "ipython" if args.in_process_harbor else args.harness
+    run_name = f"{args.model.split('/')[-1]}-{harness}-{stamp}-{uuid.uuid4().hex[:8]}"
     # An in-process script (async_grpo_ipython.py) runs Harbor itself: no OpenEnv server, no harness to name.
     server = [] if args.in_process_harbor else ["--server", f"http://127.0.0.1:{args.server_port}", "--harness", args.harness]
     cmd = [

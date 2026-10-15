@@ -569,7 +569,11 @@ class _AsyncRolloutLoop:
                         reset_kwargs = (
                             {k: v for k, v in row.items() if k != "environment"} if self._multi_environment else row
                         )
-                        observation = environment.reset(**reset_kwargs)
+                        # Off the event loop, like tool calls: a reset can take seconds (e.g. starting a sandbox), and
+                        # blocking here would stall inflight rollouts and the heartbeat.
+                        observation = await asyncio.get_running_loop().run_in_executor(
+                            self._tool_pool, functools.partial(environment.reset, **reset_kwargs)
+                        )
                     # `prompt` is optional only when an environment owns the data; `reset()` then supplies it. Without
                     # an environment, a missing `prompt` is a malformed dataset and must still fail fast (KeyError).
                     if "prompt" not in row and self.environment_factories is not None:

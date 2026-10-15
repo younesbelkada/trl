@@ -15,13 +15,14 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "trl @ git+https://github.com/younesbelkada/trl.git@async-grpo-harbor-slurm",
+#     "trl @ git+https://github.com/younesbelkada/trl.git@async-grpo-ipython",
 #     "openenv[harbor] @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
 #     "vllm==0.25.1",
 #     "flashinfer-jit-cache==0.6.13",
 #     "kernels>=0.17.0,<0.18.0",
 #     "flash-linear-attention",
 #     "ray",
+#     "ipyharness @ git+https://github.com/huggingface/ipython-harness.git@9a06fd8b62e5e9c89e8b0f37de1d3e96694ba19f",
 #     "datasets>=3.2",
 #     "peft",
 #     "trackio",
@@ -425,6 +426,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     # Evaluation mode: no training. Each policy (Hub id or checkpoint folder) is served in turn and evaluated with
     # evaluate_harbor.py on the --n-tasks prepared tasks of --split, under every --eval-harnesses.
     p.add_argument("--eval-checkpoints", nargs="+", default=None)
+    # The training script drives Harbor in-process through trl.experimental.harbor (async_grpo_ipython.py): only vLLM
+    # and the trainer are started, no OpenEnv server, capture tunnel or warm-up rollout.
+    p.add_argument("--in-process-harbor", action="store_true")
     p.add_argument("--eval-harnesses", default="opencode,mini-swe-agent,pi,openhands-sdk")
     p.add_argument("--eval-script-url", default=TRAIN_SCRIPT_URL.replace("async_grpo_harbor.py", "evaluate_harbor.py"))
     return p.parse_known_args()
@@ -565,10 +569,12 @@ def main() -> None:
     if args.eval_checkpoints:
         sys.exit(run_eval(args, data_root, env_path))
 
-    server_log = logs / "openenv-server.log"
-    public_proxy = start_harbor_server(args, server_log)
-    if args.tunnel_check_s > 0:
-        threading.Thread(target=supervise_tunnel, args=(args, server_log, args.tunnel_check_s), daemon=True).start()
+    public_proxy = None
+    if not args.in_process_harbor:
+        server_log = logs / "openenv-server.log"
+        public_proxy = start_harbor_server(args, server_log)
+        if args.tunnel_check_s > 0:
+            threading.Thread(target=supervise_tunnel, args=(args, server_log, args.tunnel_check_s), daemon=True).start()
 
     vllm_url = f"http://127.0.0.1:{args.vllm_port}"
     vllm_log = logs / "vllm.log"
@@ -594,7 +600,7 @@ def main() -> None:
     proc = _spawn(vllm_cmd, vllm_log, env=vllm_env)
     wait_for_vllm(vllm_url, proc, vllm_log)
 
-    if not args.skip_warm:
+    if not args.skip_warm and not args.in_process_harbor:
         warm_sandbox_template(args, vllm_url, logs)
 
     script = pathlib.Path("async_grpo_harbor.py")
@@ -606,13 +612,14 @@ def main() -> None:
 
     stamp = os.environ.get("HF_JOB_ID") or os.environ.get("JOB_ID") or "local"
     run_name = f"{args.model.split('/')[-1]}-{args.harness}-{stamp}-{uuid.uuid4().hex[:8]}"
+    # An in-process script (async_grpo_ipython.py) runs Harbor itself: no OpenEnv server, no harness to name.
+    server = [] if args.in_process_harbor else ["--server", f"http://127.0.0.1:{args.server_port}", "--harness", args.harness]
     cmd = [
         sys.executable, str(script),
-        "--server", f"http://127.0.0.1:{args.server_port}",
+        *server,
         "--vllm-url", vllm_url,
         "--model", args.model,
         "--split", args.split,
-        "--harness", args.harness,
         "--sandbox", args.sandbox,
         "--max-inflight", str(args.max_inflight),
         "--weight-transfer", args.weight_transfer,
@@ -621,7 +628,8 @@ def main() -> None:
         "--output-dir", str(data_root / "runs" / run_name),
         *forwarded,
     ]  # fmt: skip
-    print(f"[launcher] proxy {public_proxy}  (what the sandboxed agent calls)", flush=True)
+    if public_proxy:
+        print(f"[launcher] proxy {public_proxy}  (what the sandboxed agent calls)", flush=True)
     print(f"[launcher] train {' '.join(cmd)}", flush=True)
     rc = _spawn(cmd, None, env={"CUDA_VISIBLE_DEVICES": args.train_device, "PYTHONPATH": env_path}).wait()
     print(f"[launcher] training exited {rc}", flush=True)

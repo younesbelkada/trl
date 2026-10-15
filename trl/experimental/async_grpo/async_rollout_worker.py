@@ -613,7 +613,7 @@ class _AsyncRolloutLoop:
                     if task.exception() is not None:
                         raise task.exception()
 
-                    prompt, (
+                    prompt, env_reward, (
                         completion,
                         completion_ids,
                         sequences,
@@ -629,20 +629,11 @@ class _AsyncRolloutLoop:
                     group.tool_call_counts.append(tool_call_count)
                     group.tool_failure_counts.append(tool_failure_count)
                     group.rollout_rewards.append(rollout_reward)
-                    # The environment owns the reward: score it now, while this rollout's environment still holds its
-                    # final state and before returning it to the pool. `get_reward` may be async awaiting yields to
-                    # inflight requests instead of halting them. The env is returned to the pool only after scoring, so
-                    # a concurrent rollout can't draw and reset it during the await. Record `(env class, reward)` so
-                    # `_score_group` can place it in the matching env's reward column; rollouts whose env owns no reward
-                    # record `None` (turned into NaN and ignored) to stay aligned with the group's other per-rollout lists.
+                    # Record `(env class, reward)` (scored in the rollout's task) so `_score_group` can place it in the
+                    # matching env's reward column; rollouts whose env owns no reward record `None` (turned into NaN
+                    # and ignored) to stay aligned with the group's other per-rollout lists.
                     if self._env_reward_types:
-                        env_type = type(environment)
-                        if env_type in self._env_reward_types:
-                            get_reward = environment.get_reward
-                            reward = await get_reward() if inspect.iscoroutinefunction(get_reward) else get_reward()
-                            group.env_rewards.append((env_type, reward))
-                        else:
-                            group.env_rewards.append(None)
+                        group.env_rewards.append(env_reward)
                     if environment is not None:
                         self._environment_pool[name].append(environment)
                     self._total_completion_tokens += len(completion_ids)
@@ -844,11 +835,16 @@ class _AsyncRolloutLoop:
 
     async def _reset_and_generate(
         self, environment, row: dict, tool_dict: dict[str, Callable], tools: list[Callable], group_id: int
-    ) -> tuple[Messages, tuple[list[dict[str, str]], list[int], list[TrainingSequence], int, int, float | None]]:
-        """Reset the rollout's environment, fold its observation into the prompt, and roll out from that prompt.
+    ) -> tuple[
+        Messages,
+        tuple[type, float] | None,
+        tuple[list[dict[str, str]], list[int], list[TrainingSequence], int, int, float | None],
+    ]:
+        """Reset the rollout's environment, fold its observation into the prompt, roll out, and score the environment.
 
-        Runs inside the rollout's task, so resets that take seconds (e.g. starting a sandbox) overlap with each other
-        and with inflight generation instead of filling the slots one at a time. Returns `(prompt, <_generate_one's>)`.
+        Runs inside the rollout's task, so resets and verifiers that take seconds (e.g. starting a sandbox) overlap with
+        each other and with inflight generation instead of running one at a time. Returns `(prompt, (env class, env
+        reward) or None, <_generate_one's return>)`.
         """
         # Reset BEFORE building the prompt and capture its initial observation (e.g. a task instruction). The reset()
         # return was previously discarded, so an environment_factory whose task lives in the observation (not the
@@ -880,7 +876,19 @@ class _AsyncRolloutLoop:
             if isinstance(observation, str) and isinstance(content, list):
                 observation = [{"type": "text", "text": observation}]
             prompt = prompt[:-1] + [{**last, "content": content + observation}]
-        return prompt, await self._generate_one(prompt, tool_dict=tool_dict, tools=tools, group_id=group_id)
+        result = await self._generate_one(prompt, tool_dict=tool_dict, tools=tools, group_id=group_id)
+        # The environment owns the reward: score it now, while this rollout's environment still holds its final state.
+        # The env is returned to the pool only once this task is done, so a concurrent rollout can't draw and reset it
+        # meanwhile. Off the event loop like tool calls, so verifiers (seconds each) run concurrently across rollouts.
+        env_reward = None
+        if type(environment) in self._env_reward_types:
+            get_reward = environment.get_reward
+            if inspect.iscoroutinefunction(get_reward):
+                reward = await get_reward()
+            else:
+                reward = await asyncio.get_running_loop().run_in_executor(self._tool_pool, get_reward)
+            env_reward = (type(environment), reward)
+        return prompt, env_reward, result
 
     async def _generate_one(
         self, prompt: Messages, tool_dict: dict[str, Callable], tools: list[Callable], group_id: int = 0

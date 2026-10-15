@@ -162,6 +162,11 @@ class IPythonEnv(HarborEnv):
         print(f"[ipython] {Path(task_dir).name}: sandbox ready in {time.monotonic() - started:.0f}s", flush=True)
         return instruction
 
+    def get_reward(self) -> float:
+        # AsyncGRPO scores an environment through `get_reward`: `HarborSpec.reward_funcs` reads `environments=`, which
+        # only `GRPOTrainer` passes. The verifier's scalar, as `HarborEnv.reward` computes it.
+        return self.reward
+
     async def _shell(self, command: str, timeout: int | None = None, user: str | None = None) -> tuple[str, str, int]:
         result = await self._env.exec(command, timeout_sec=timeout, user=user)
         return result.stdout or "", result.stderr or "", result.return_code
@@ -370,7 +375,6 @@ def main() -> None:
         train_dataset=dataset,
         processing_class=AutoTokenizer.from_pretrained(args.model),
         environment_factory=spec.environment_factory,
-        reward_funcs=spec.reward_funcs,
         peft_config=peft_config,
         weight_transfer=IPCWeightTransfer(args.vllm_url) if args.weight_transfer == "ipc" else None,
     )

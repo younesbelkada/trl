@@ -28,10 +28,16 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "accelerate>=1.4.0",
+    "accelerate>=1.10.1",
     "datasets>=4.7.0",  # Support Json type and on_mixed_types="use_json"
+    "huggingface_hub>=0.34.0",
     "jinja2",
+    "numpy>=1.26.0",
     "packaging>20.0",
+    "pandas>=2.1.1",
+    "psutil>=5.9.4",
+    "pyarrow>=21.0.0",
+    "pyyaml>=6.0.1",
     "transformers>=4.56.2",
 ]
 dynamic = ["version"]
@@ -71,19 +77,17 @@ quality = [
     "hf-doc-builder"
 ]
 quantization = [
-    "bitsandbytes"
+    "bitsandbytes>=0.45.1"  # older versions import triton.ops, removed in Triton 3.2 (torch 2.6)
 ]
 test = [
     "pytest-cov",
     "pytest-datadir>=1.7.0",  # lazy datadirs
-    "pytest-reportlog",  # test report consumed by scripts/log_reports.py
     "pytest-rerunfailures>=16.7",  # only_rerun matches wrapped exceptions
     "pytest-xdist",
     "pytest",
-    "tabulate"  # test report rendering in scripts/log_reports.py
 ]
 vllm = [
-    "vllm>=0.21.0,<=0.31.0",
+    "vllm>=0.22.0,<=0.31.0",
     "aiohttp>=3.13.3",
     "requests",
 ]
@@ -108,15 +112,13 @@ dev = [
     "pre-commit",
     "hf-doc-builder",
     # quantization
-    "bitsandbytes",
+    "bitsandbytes>=0.45.1",  # older versions import triton.ops, removed in Triton 3.2 (torch 2.6)
     # test
     "pytest-cov",
     "pytest-datadir>=1.7.0",  # lazy datadirs
-    "pytest-reportlog",  # test report consumed by scripts/log_reports.py
     "pytest-rerunfailures>=16.7",  # only_rerun matches wrapped exceptions
     "pytest-xdist",
     "pytest",
-    "tabulate",  # test report rendering in scripts/log_reports.py
     # vllm: not included in dev by default due to CUDA error; see GH-4228
     # vlm
     "Pillow",
@@ -165,8 +167,6 @@ known-first-party = ["trl"]
 
 [tool.pytest.ini_options]
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "low_priority: marks tests as low priority (deselect with '-m \"not low_priority\"')",
     "invariant: training-invariant checks (run with '-m invariant')",
 ]
 norecursedirs = [
@@ -238,4 +238,12 @@ filterwarnings = [
     # Upstream issue: https://github.com/pytorch/pytorch/issues/175484
     # Remove once: no supported torch version emits it
     "ignore:TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled:UserWarning",
+
+    # peft warns on every generate step of prompt learning models (prompt tuning, P-tuning) that it ignores
+    # position_ids, which transformers' generate builds itself (upstream, not actionable in TRL)
+    # Triggered by the GRPO prompt tuning test, the only prompt tuning test that generates
+    # Tracking issue: https://github.com/huggingface/trl/issues/7585
+    # Upstream issue: https://github.com/huggingface/peft/issues/3911
+    # Remove once: no supported peft version emits it
+    "ignore:Position ids are not supported for parameter efficient tuning:UserWarning",
 ]

@@ -125,19 +125,21 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         ):
             yield
 
-    def _inputs(self, B=2, K=6, H=8, V=17, n_masked=3, seed=0):
-        g = torch.Generator(torch_device).manual_seed(seed)
-        student_hidden = torch.randn(B, K, H, generator=g, device=torch_device)
-        teacher_hidden = torch.randn(B, K, H, generator=g, device=torch_device)
-        student_w = torch.randn(V, H, generator=g, device=torch_device)
-        teacher_w = torch.randn(V, H, generator=g, device=torch_device)
-        completion_mask = torch.ones(B, K, device=torch_device)
-        completion_mask.reshape(-1)[torch.randperm(B * K, generator=g, device=torch_device)[:n_masked]] = 0
+    def _inputs(self, B=2, K=6, H=8, V=17, n_masked=3, seed=0, device=torch_device):
+        g = torch.Generator(device).manual_seed(seed)
+        student_hidden = torch.randn(B, K, H, generator=g, device=device)
+        teacher_hidden = torch.randn(B, K, H, generator=g, device=device)
+        student_w = torch.randn(V, H, generator=g, device=device)
+        teacher_w = torch.randn(V, H, generator=g, device=device)
+        completion_mask = torch.ones(B, K, device=device)
+        completion_mask.reshape(-1)[torch.randperm(B * K, generator=g, device=device)[:n_masked]] = 0
         return student_hidden, teacher_hidden, student_w, teacher_w, completion_mask
 
+    # CPU tensors stand in for an accelerator without Triton (e.g. Trainium): TRL does not target CPU training
+    @pytest.mark.parametrize("device", [torch_device, "cpu"])
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
-    def test_matches_naive_full_vocab(self, beta):
-        sh, th, sw, tw, mask = self._inputs()
+    def test_matches_naive_full_vocab(self, beta, device):
+        sh, th, sw, tw, mask = self._inputs(device=device)
         loss, _, n_valid = _chunked_divergence_loss(sh, th, sw, tw, mask, beta)
         expected = _reference_chunked_divergence(sh, th, sw, tw, mask, beta)
         torch.testing.assert_close(loss, expected)
@@ -1264,6 +1266,36 @@ class TestDistillationTrainer(TrlTestCase):
             elif "base_layer" not in n:  # We expect the peft params to be different (except for the base layer)
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    @require_torch_accelerator
+    def test_train_with_fp16(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        training_args = DistillationConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            fp16=True,
+            report_to="none",
+        )
+        trainer = DistillationTrainer(
+            model="trl-internal-testing/tiny-Qwen3ForCausalLM",
+            teacher_model="trl-internal-testing/small-Qwen3ForCausalLM",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
     @require_peft
     def test_peft_non_lm_head_target_allowed(self):
         # The lm_head guard must only fire when the adapter actually wraps lm_head. An adapter targeting other modules
@@ -1502,6 +1534,8 @@ class TestDistillationTrainerVLM(TrlTestCase):
             args=training_args,
             train_dataset=dataset,
         )
+        # A text-only batch would leave the vision tower without gradients, so DDP looks for unused parameters
+        assert trainer.args.ddp_find_unused_parameters
 
         trainer.train()
 

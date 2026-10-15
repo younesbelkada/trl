@@ -106,6 +106,7 @@ hf jobs uv run --flavor h200 --image huggingface/trl --secrets HF_TOKEN --timeou
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -323,26 +324,37 @@ def merge_lora(adapter: str, out: pathlib.Path) -> str:
     return str(out)
 
 
-def run_eval(args: argparse.Namespace, data_root: pathlib.Path, env_path: str) -> int:
-    """Evaluate each of `--eval-checkpoints` in turn on the prepared test tasks; results go to <data root>/eval/."""
-    script = pathlib.Path("evaluate_harbor.py")
+def run_eval(args: argparse.Namespace, data_root: pathlib.Path, env_path: str, forwarded: list[str]) -> int:
+    """Evaluate each of `--eval-checkpoints` in turn on the prepared test tasks; results go to <data root>/eval/.
+
+    With `--in-process-harbor`, `--eval-script-url` is evaluate_ipython.py: it runs Harbor itself (no OpenEnv server),
+    imports its environment and prompt from the training script at `--train-script-url`, and gets `forwarded`.
+    """
+    script = pathlib.Path(args.eval_script_url.rsplit("/", 1)[-1])
     urllib.request.urlretrieve(args.eval_script_url, script)
-    # A run folder stands for all of its checkpoints, in step order.
+    if args.in_process_harbor:
+        urllib.request.urlretrieve(args.train_script_url, args.train_script_url.rsplit("/", 1)[-1])
+    harnesses = ["ipython"] if args.in_process_harbor else args.eval_harnesses.split(",")
+    # A run folder stands for all of its checkpoints, in step order. A pattern (e.g. '/outputs/runs/*<job id>*') is
+    # expanded here, in the job, where the bucket is mounted.
     checkpoints = []
-    for path in args.eval_checkpoints:
-        found = sorted(pathlib.Path(path).glob("checkpoint-*"), key=lambda p: int(p.name.rsplit("-", 1)[1]))
-        checkpoints += [str(p) for p in found] if found else [path]
+    for pattern in args.eval_checkpoints:
+        for path in sorted(glob.glob(pattern)) or [pattern]:
+            found = sorted(pathlib.Path(path).glob("checkpoint-*"), key=lambda p: int(p.name.rsplit("-", 1)[1]))
+            checkpoints += [str(p) for p in found] if found else [path]
     rc = 0
     for checkpoint in checkpoints:
         # /outputs/runs/<run>/checkpoint-N -> runs_<run>_checkpoint-N; a Hub id keeps its name.
         label = re.sub(r"[^\w.-]+", "_", str(pathlib.Path(checkpoint).resolve().relative_to(data_root.resolve()))
                        if checkpoint.startswith(str(data_root)) else checkpoint)
+        if args.in_process_harbor:  # apart from the harness evals of the same policy, and per system prompt
+            label += "--ipython" + ("-no-magics" if "--no-magics-prompt" in forwarded else "")
         out = data_root / "eval" / label
         out.mkdir(parents=True, exist_ok=True)
         summary = out / "summary.json"
         if summary.exists():
             done = json.loads(summary.read_text())
-            same_harnesses = sorted(done["harnesses"]) == sorted(args.eval_harnesses.split(","))
+            same_harnesses = sorted(done["harnesses"]) == sorted(harnesses)
             if same_harnesses and done["overall"]["coverage"] >= 1:
                 print(f"[launcher] {checkpoint} already evaluated, skipping ({summary})", flush=True)
                 continue
@@ -353,9 +365,12 @@ def run_eval(args: argparse.Namespace, data_root: pathlib.Path, env_path: str) -
         if (pathlib.Path(checkpoint) / "adapter_config.json").exists():
             served = merge_lora(checkpoint, pathlib.Path("merged") / label)
         # One server per policy, so its trial folders stay apart; the factories keep one connection per harness.
-        server_log = out / "openenv-server.log"
-        server = _spawn(_serve_cmd(args), server_log, env={
-            "MAX_CONCURRENT_ENVS": str(args.max_inflight + 8), "OPENENV_HARBOR_TRIALS_DIR": str(trials.resolve())})
+        procs = []
+        if not args.in_process_harbor:
+            server_log = out / "openenv-server.log"
+            server_env = {
+                "MAX_CONCURRENT_ENVS": str(args.max_inflight + 8), "OPENENV_HARBOR_TRIALS_DIR": str(trials.resolve())}
+            procs.append(_spawn(_serve_cmd(args), server_log, env=server_env))
         vllm_url = f"http://127.0.0.1:{args.vllm_port}"
         vllm_cmd = [
             "vllm", "serve", served,
@@ -371,22 +386,25 @@ def run_eval(args: argparse.Namespace, data_root: pathlib.Path, env_path: str) -
         if args.gpu_memory_utilization is not None:
             vllm_cmd += ["--gpu-memory-utilization", str(args.gpu_memory_utilization)]
         vllm = _spawn(vllm_cmd, out / "vllm.log", env={"CUDA_VISIBLE_DEVICES": args.vllm_device})
+        procs.append(vllm)
         try:
-            wait_for_public_proxy(server_log, args.capture_port)
             wait_for_vllm(vllm_url, vllm, out / "vllm.log")
-            cmd = [
-                sys.executable, str(script),
-                "--server", f"http://127.0.0.1:{args.server_port}", "--vllm-url", vllm_url,
-                "--model", args.model, "--checkpoint", checkpoint, "--split", args.split,
-                "--harnesses", args.eval_harnesses, "--sandbox", args.sandbox,
+            common = [
+                sys.executable, str(script), "--vllm-url", vllm_url,
+                "--model", args.model, "--checkpoint", checkpoint, "--split", args.split, "--sandbox", args.sandbox,
                 "--n-tasks", str(args.n_tasks), "--concurrency", str(args.max_inflight), "--output-dir", str(out),
             ]  # fmt: skip
+            if args.in_process_harbor:
+                cmd = [*common, *forwarded]
+            else:
+                wait_for_public_proxy(server_log, args.capture_port)
+                cmd = [*common, "--server", f"http://127.0.0.1:{args.server_port}", "--harnesses", args.eval_harnesses]
             with open(out / "eval.log", "w") as log:
                 env = {**os.environ, "PYTHONPATH": env_path}
                 rc |= subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
             print((out / "eval.log").read_text().rsplit("\n\n", 1)[-1], flush=True)  # the summary table
         finally:
-            for proc in (vllm, server):
+            for proc in procs:
                 _stop_process(proc)
                 _children.remove(proc)
             if trials.exists():  # one archive per policy, for analyze_trajectories.py / compare_trajectories.py
@@ -567,7 +585,7 @@ def main() -> None:
         env_path += os.pathsep + os.environ["PYTHONPATH"]
 
     if args.eval_checkpoints:
-        sys.exit(run_eval(args, data_root, env_path))
+        sys.exit(run_eval(args, data_root, env_path, forwarded))
 
     public_proxy = None
     if not args.in_process_harbor:

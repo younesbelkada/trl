@@ -156,6 +156,13 @@ MAGICS_PROMPT = """IPython magics go inside `ipython` cells; they are not tools:
 - `%run <file.py>` runs a Python script in the kernel."""
 
 
+def system_prompt(task_python: str, magics: bool) -> str:
+    """ipyh's system prompt for a task interpreter, with `MAGICS_PROMPT` appended when `magics` (evaluate_ipython.py
+    builds the same one)."""
+    prompt = DEFAULT_SYSTEM_PROMPT.format(python=TASK_PYTHON.format(path=task_python))
+    return prompt + "\n\n" + MAGICS_PROMPT if magics else prompt
+
+
 def write_file_command(path: str, content: str) -> str:
     return f"echo {shlex.quote(base64.b64encode(content.encode()).decode())} | base64 -d > {path}"
 
@@ -336,10 +343,7 @@ def main() -> None:
 
     spec = HarborSpec(args.split, agent=IPythonEnv, environment_type=args.sandbox, num_tasks=args.n_tasks)
     # ipyh's system prompt goes first; TRL appends the task instruction (from `reset`) to the empty user message.
-    system_prompt = DEFAULT_SYSTEM_PROMPT.format(python=TASK_PYTHON.format(path=args.task_python))
-    if not args.no_magics_prompt:
-        system_prompt += "\n\n" + MAGICS_PROMPT
-    system = {"role": "system", "content": system_prompt}
+    system = {"role": "system", "content": system_prompt(args.task_python, magics=not args.no_magics_prompt)}
     dataset = spec.train_dataset.map(lambda row: {"prompt": [system, *row["prompt"]]})
     print(f"tasks {len(dataset)} from {args.split} on {args.sandbox}; output {output_dir}")
 

@@ -150,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--harness", default="mini-swe-agent", help="any harness the server reports; see the docstring")
     p.add_argument("--sandbox", default="e2b")
     p.add_argument("--reward-key", default="")
+    p.add_argument("--tree-attn-backend", default=None)
     p.add_argument("--n-tasks", type=int, default=32)
     p.add_argument("--task-indices", default="", help="comma-separated indices, or @path to a file of them")
     p.add_argument("--num-generations", type=int, default=8)
@@ -237,6 +238,7 @@ def main() -> None:
         log_completions=True,
         logging_steps=1,
         seed=0,
+        tree_attn_backend=args.tree_attn_backend,
     )
 
     worker = HarnessRolloutWorker(

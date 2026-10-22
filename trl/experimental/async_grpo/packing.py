@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import cache
-from typing import Any
+from functools import cache, partial
+from typing import Any, Optional
 
 import torch
 from transformers import AttentionInterface
@@ -165,8 +165,12 @@ TREE_ATTENTION = "tree_fa3"
 
 
 @cache
-def _flash_attn():
+def _flash_attn(tree_attn_kernel: Optional[str] = None):
     from kernels import get_kernel
+
+    if tree_attn_kernel:
+        kernel_name, version = tree_attn_kernel.split(":")[0], int(tree_attn_kernel.split(":")[1])
+        return get_kernel(kernel_name, version=version)
 
     if torch.version.hip:
         return get_kernel("kernels-community/aiter-flash-attn", version=2)
@@ -191,11 +195,12 @@ def tree_attention(
     scaling=None,
     sliding_window=None,
     softcap=None,
+    tree_attn_kernel=None,
     **kwargs,
 ):
     dtype = get_target_dtype(query, module) or query.dtype
     query, key, value = (x.transpose(1, 2)[0].to(dtype) for x in (query, key, value))
-    out = _flash_attn().flash_attn_varlen_func(
+    out = _flash_attn(tree_attn_kernel).flash_attn_varlen_func(
         query,
         key.index_select(0, tree_kv_index),
         value.index_select(0, tree_kv_index),
@@ -212,6 +217,6 @@ def tree_attention(
     return out.unsqueeze(0), None
 
 
-def register_tree_attention() -> None:
-    AttentionInterface.register(TREE_ATTENTION, tree_attention)
+def register_tree_attention(tree_attn_kernel: Optional[str] = None) -> None:
+    AttentionInterface.register(TREE_ATTENTION, partial(tree_attention, tree_attn_kernel=tree_attn_kernel))
     AttentionMaskInterface.register(TREE_ATTENTION, lambda **kwargs: None)

@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from ...trainer.base_config import _BaseConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -394,6 +397,13 @@ class AsyncGRPOConfig(_BaseConfig):
         default=None,
         metadata={"help": "Number of completions to print with `rich`. If `None`, all completions are logged."},
     )
+    tree_attn_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "Tree attention backlend to use (FA2, FA3, FA4, etc.). This must be a valid kernel from "
+            "`kernels` library."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -426,3 +436,27 @@ class AsyncGRPOConfig(_BaseConfig):
         else:
             self.accelerator_config.split_batches = True
             self.accelerator_config.dispatch_batches = True
+
+        if self.tree_attn_backend:
+            # Async GRPO now uses Tree attention by default, we just need to make sure that the
+            # flash attn function being used supports varlen_func
+            try:
+                from kernels import get_kernel
+            except ValueError:
+                logger.warning("could not import kernels. Training might fail")
+                return
+
+            if ":" not in self.tree_attn_backend:
+                raise ValueError(
+                    "Tree attention backend must be in format 'hub_id:version', e.g.: kernels-community/flash-attn2:3"
+                )
+
+            kernel_name, version = self.tree_attn_backend.split(":")[0], int(self.tree_attn_backend.split(":")[1])
+            fa_kernel = get_kernel(kernel_name, version=version)
+
+            if not hasattr(fa_kernel, "flash_attn_varlen_func"):
+                raise ValueError(
+                    f"Tree attention kernel {self.tree_attn_backend} does not have an implementation "
+                    " for `flash_attn_varlen_func` - therefore tree attention will fail. Please fallback "
+                    "to a valid flash attention kernel."
+                )

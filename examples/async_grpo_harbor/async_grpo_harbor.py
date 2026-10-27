@@ -17,6 +17,7 @@
 #     "trl",
 #     "trackio",
 #     "datasets",
+#     "peft",
 #     "openenv @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
 # ]
 # ///
@@ -82,6 +83,7 @@ from functools import partial
 
 from datasets import Dataset
 from harbor_env.harness import HarborSessionFactory
+from peft import LoraConfig
 from transformers import AutoTokenizer
 
 from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
@@ -164,6 +166,9 @@ def parse_args() -> argparse.Namespace:
     # Bound model calls; rewritten histories can still produce multiple training rows.
     p.add_argument("--agent-step-limit", type=int, default=12)
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
+    # 0 trains every weight. With LoRA, start vLLM with `--enable-lora` so syncs publish only the adapter.
+    p.add_argument("--lora-r", type=int, default=0)
+    p.add_argument("--lora-alpha", type=int, default=None, help="defaults to 2 * --lora-r")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--project", default="async-grpo-harbor")
     p.add_argument("--trackio-space-id", default=None, help="host the trackio dashboard on a HF Space")
@@ -260,12 +265,19 @@ def main() -> None:
         eos_token_ids=eos_token_ids,
     )
 
+    peft_config = None
+    if args.lora_r:
+        peft_config = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha or 2 * args.lora_r, target_modules="all-linear"
+        )
+
     trainer = AsyncGRPOTrainer(
         model=args.model,
         args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
         rollout_worker=worker,
+        peft_config=peft_config,
     )
     trainer.train()
     trainer.save_model()

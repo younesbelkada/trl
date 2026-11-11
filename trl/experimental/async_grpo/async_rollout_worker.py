@@ -564,6 +564,9 @@ class AsyncRolloutLoop:
             max_workers=max(1, config.max_concurrent_rollouts), thread_name_prefix="grpo-tool"
         )
 
+        # Starts at the requested concurrency, not at `KV cache tokens / max_model_len`: agent rollouts use a small
+        # fraction of max_model_len, and growing 25% per turnover of the pool took hours when rollouts last minutes.
+        # The control loop still cuts it when the server's KV cache fills up.
         self._kv_cap = config.max_concurrent_rollouts
         self._total_rollouts = 0
         self._metrics_poll_s = 5.0
@@ -667,7 +670,6 @@ class AsyncRolloutLoop:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             self.session = session
             await self._check_sampling_replay()
-            await self._init_kv_cap()
             logger.info(
                 f"vllm worker started: num_generations={self.config.num_generations}, "
                 f"max_concurrent_rollouts={self.config.max_concurrent_rollouts}, kv_cap={self._kv_cap}, "
@@ -693,26 +695,6 @@ class AsyncRolloutLoop:
             return False
         expected_tokens = self._produced_tokens + self._rollouts_unqueued * self._tokens_per_rollout
         return expected_tokens < self._token_allowance.value
-
-    async def _init_kv_cap(self) -> None:
-        """Start the cap at `KV cache tokens / max_model_len`: as many requests as fit at full length."""
-        try:
-            async with self.session.get(f"{self.vllm_server_url}/metrics") as response:
-                response.raise_for_status()
-                text = await response.text()
-            async with self.session.get(f"{self.vllm_server_url}/v1/models") as response:
-                response.raise_for_status()
-                models = await response.json()
-        except Exception as e:
-            logger.warning(f"Could not read the vLLM server's KV capacity, starting at max_concurrent_rollouts: {e!r}")
-            return
-        kv_matches = re.findall(r'^vllm:cache_config_info\{.*kv_cache_size_tokens="(\d+)"', text, re.M)
-        if not kv_matches:
-            logger.warning("`/metrics` has no `kv_cache_size_tokens`, starting at max_concurrent_rollouts")
-            return
-        kv_tokens = sum(map(int, kv_matches))
-        max_model_len = max(model["max_model_len"] for model in models["data"] if model["max_model_len"])
-        self._kv_cap = max(1, min(self.config.max_concurrent_rollouts, kv_tokens // max_model_len))
 
     async def _control_loop(self, stop_event: asyncio.Event) -> None:
         """Size the KV cap from the vLLM server's load, polled from `/metrics`.

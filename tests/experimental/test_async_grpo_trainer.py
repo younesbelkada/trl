@@ -1017,8 +1017,8 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
             loop._loop.close()
 
     def test_kv_cap_follows_vllm_load(self):
-        # The KV cap starts at `KV cache tokens / max_model_len`, grows while the server reads clear, is cut
-        # when KV usage passes 0.8 and holds until the pool has drained below it.
+        # The KV cap starts at `max_concurrent_rollouts`, is cut when KV usage passes 0.8, holds until the pool has
+        # drained below it, and grows back while the server reads clear.
         import aiohttp
         from aiohttp import web
         from aiohttp.test_utils import TestServer
@@ -1068,14 +1068,12 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
             async with TestServer(app) as server, aiohttp.ClientSession() as session:
                 loop.vllm_server_url = str(server.make_url("")).rstrip("/")
                 loop.session = session
-                await loop._init_kv_cap()
-                assert loop._kv_cap == 4
+                assert loop._kv_cap == 8
                 stop_event = asyncio.Event()
                 tasks = [
                     asyncio.create_task(loop._generate_loop(stop_event)),
                     asyncio.create_task(loop._control_loop(stop_event)),
                 ]
-                await wait_until(lambda: loop._kv_cap == 8)
                 await wait_until(lambda: running["peak"] == 8 and load["polls"] >= 2)
                 load["usage"] = 0.7
                 load["spike"] = 0.9

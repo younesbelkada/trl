@@ -1348,7 +1348,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # Adapter-only vLLM sync is derived from a PEFT model plus a server started with `--enable-lora`, rather
         # than configured. Rank 0 probes and broadcasts the answer below.
         self._lora_sync = False
-        self._lora_name = "trl-policy"
+        self._lora_name = self.args.vllm_lora_name
         # Absolute: the path is resolved by the *server's* process, which has its own working directory and may not
         # be on this machine. vLLM reads a path it cannot resolve as a Hub repo id, failing deep inside the engine.
         self._lora_dir = os.path.abspath(os.path.join(self.args.output_dir, ".vllm_lora"))
@@ -1967,11 +1967,10 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # Under DDP `self.model` is the wrapper, which does not expose `save_pretrained`.
         model = self.accelerator.unwrap_model(self.model)
 
-        logger.info("Weight sync: pausing vLLM...")
-        if self.accelerator.is_main_process:
-            self.vllm_client.pause()
+        # No `/pause`: in-flight requests keep the adapter they named, and pausing would stall every other trainer
+        # sharing this server.
         t_pause = time.time()
-        logger.info(f"Weight sync: pause took {t_pause - t0:.1f}s, waiting for all ranks...")
+        logger.info("Weight sync: waiting for all ranks...")
 
         self.accelerator.wait_for_everyone()
         t_barrier = time.time()
@@ -1984,12 +1983,11 @@ class AsyncDistillationTrainer(_BaseTrainer):
 
         self.accelerator.wait_for_everyone()
 
-        logger.info(f"Weight sync: resuming vLLM... (transfer took {t_transfer - t_barrier:.1f}s)")
+        logger.info(f"Weight sync: loading adapter... (transfer took {t_transfer - t_barrier:.1f}s)")
         if self.accelerator.is_main_process:
             # The adapter has to exist on the server BEFORE the version moves below: the rollout worker derives the
             # adapter it requests from `model_version`, so bumping first would name one that is not loaded yet.
             self.vllm_client.load_lora_adapter(f"{self._lora_name}-v{version}", adapter_dir)
-            self.vllm_client.resume()
             stale_version = version - (self.args.max_staleness + 1)
             if stale_version > 0:
                 self.vllm_client.unload_lora_adapter(f"{self._lora_name}-v{stale_version}")

@@ -84,6 +84,9 @@ class AsyncDistillationConfig(_BaseConfig):
             Timeout in seconds for calls to the vLLM servers: waiting for the student's server to be ready at startup,
             each generation or scoring request, and each weight-sync call. Waiting for the server and weight-sync calls
             raise when it runs out; a generation or scoring request that times out is retried.
+        vllm_lora_name (`str`, *optional*, defaults to `"trl-policy"`):
+            Prefix of the adapter names published to the student's vLLM server under adapter-only sync
+            (`{vllm_lora_name}-v{N}`). Give each trainer its own prefix when several share one server.
         teacher_server_urls (`dict[str, str]`, *optional*, defaults to `{"default": "http://localhost:8001"}`):
             Teacher vLLM server(s), each started with `vllm serve <teacher-model> --logprobs-mode processed_logprobs
             --max-logprobs -1`. Every teacher is static: this trainer never streams weight updates to any of them, so a
@@ -293,6 +296,13 @@ class AsyncDistillationConfig(_BaseConfig):
             "help": "Timeout in seconds for calls to the vLLM servers: waiting for the student's server to be ready "
             "at startup, each generation or scoring request, and each weight-sync call. Waiting for the server and "
             "weight-sync calls raise when it runs out; a generation or scoring request that times out is retried."
+        },
+    )
+    vllm_lora_name: str = field(
+        default="trl-policy",
+        metadata={
+            "help": "Prefix of the adapter names published to the student's vLLM server under adapter-only sync "
+            "(`{vllm_lora_name}-v{N}`). Give each trainer its own prefix when several share one server."
         },
     )
     teacher_server_urls: dict[str, str] | str | None = field(

@@ -3011,7 +3011,20 @@ class TestAsyncGRPOTrainerPeft(TrlTestCase):
         # The server resolves the path in its own process, with its own cwd, possibly on another host. vLLM reads a
         # path it cannot resolve as a Hub repo id, so a relative one dies inside the engine.
         assert os.path.isabs(path)
-        assert fake_vllm.paused is False  # paused for the publish, resumed after
+        # A new adapter name leaves in-flight requests on the one they named, so the sync never pauses the server, which
+        # other trainers may share.
+        assert "/pause" not in fake_vllm.requests
+
+    def test_adapter_sync_publishes_under_the_configured_name(self, fake_vllm):
+        # Trainers sharing one server need distinct names, or each would load and unload the other's adapters.
+        trainer = self._build(
+            fake_vllm, self._lora_config(), lora_config=SERVER_LORA_CONFIG, vllm_lora_name="hermes-hard"
+        )
+
+        trainer._sync_weight()
+
+        assert list(fake_vllm.loaded) == ["hermes-hard-v1"]
+        assert trainer.rollout_worker._loop_kwargs["lora_name"] == "hermes-hard"
 
     @pytest.mark.parametrize(
         ("max_staleness", "max_loras", "servable_after_five"),

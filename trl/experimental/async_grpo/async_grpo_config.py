@@ -88,6 +88,9 @@ class AsyncGRPOConfig(_BaseConfig):
             Timeout in seconds for calls to the vLLM server: waiting for it to be ready at startup, each generation
             request, and each weight-sync call. Waiting for the server and weight-sync calls raise when it runs out; a
             generation request that times out is retried.
+        vllm_lora_name (`str`, *optional*, defaults to `"trl-policy"`):
+            Prefix of the adapter names published to the vLLM server under adapter-only sync (`{vllm_lora_name}-v{N}`).
+            Give each trainer its own prefix when several share one server.
 
         > Parameters that control the training
 
@@ -294,6 +297,13 @@ class AsyncGRPOConfig(_BaseConfig):
             "help": "Timeout in seconds for calls to the vLLM server: waiting for it to be ready at startup, each "
             "generation request, and each weight-sync call. Waiting for the server and weight-sync calls raise when "
             "it runs out; a generation request that times out is retried."
+        },
+    )
+    vllm_lora_name: str = field(
+        default="trl-policy",
+        metadata={
+            "help": "Prefix of the adapter names published to the vLLM server under adapter-only sync "
+            "(`{vllm_lora_name}-v{N}`). Give each trainer its own prefix when several share one server."
         },
     )
 

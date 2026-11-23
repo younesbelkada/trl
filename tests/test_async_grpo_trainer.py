@@ -24,6 +24,7 @@ import os
 import queue
 import select
 import socket
+import sys
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -55,6 +56,7 @@ from trl import AsyncGRPOConfig, AsyncGRPOTrainer
 from trl.chat_template_utils import _SUPPORTS_RESPONSE_TEMPLATE
 from trl.generation import weight_transfer as weight_transfer_module
 from trl.generation.weight_transfer import WeightTransferClient
+from trl.kernels.tree_qwen4_exp import tree_parent_index, tree_qsa_attention
 from trl.trainer import async_grpo_trainer as async_grpo_trainer_module
 from trl.trainer.async_grpo_trainer import (
     TREE_ATTENTION,
@@ -4111,6 +4113,14 @@ class TestTreePacking(TrlTestCase):
         assert row["input_ids"].tolist() == [101, 102, 103, 201, 202, 202, 401, 103, 301, 302]
         assert row["position_ids"].tolist() == [0, 1, 2, 3, 4, 4, 5, 2, 3, 4]
 
+    def test_parent_index_points_at_the_token_before_in_its_samples(self):
+        row = _tree_row(self.ROWS).pack()
+
+        # Inside a segment the previous position; at a segment start, the end of the parent segment: the second `202`
+        # (5) follows the `201` at 3, not the first `202` at 4, and the second `103` (7) follows the `102` at 1
+        parent_index = tree_parent_index(row, len(row["input_ids"]))
+        assert parent_index.tolist() == [-1, 0, 1, 2, 3, 3, 5, 1, 7, 8]
+
     def test_one_packed_position_feeds_several_loss_terms(self):
         row = _tree_row(self.ROWS).pack()
 
@@ -4281,6 +4291,7 @@ _LFM2_CONV_BEFORE_5_22 = pytest.mark.skipif(
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-Think", {}, id="qwen35-gdn"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-3.8", {}, id="qwen38-gdn"),
         pytest.param("trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6", {}, id="qwen36-moe-gdn"),
+        pytest.param("ybelkada/tiny-Qwen4ExpForConditionalGeneration", {}, id="qwen4-exp-qsa-ple"),
         pytest.param("trl-internal-testing/tiny-NemotronHForCausalLM-nano", {}, id="nemotron-h-mamba2"),
         pytest.param("trl-internal-testing/tiny-Lfm2ForCausalLM", {}, id="lfm2-conv", marks=_LFM2_CONV_BEFORE_5_22),
         pytest.param(
@@ -4400,8 +4411,11 @@ class TestTreePackingParity(TrlTestCase):
                 param.data.fill_(-4.0)
         samples = self._samples(truncated)
         collator = DataCollatorForRollout(pad_token_id=0)
-        # The per-sample reference uses the kernel that tree attention picks for this device
-        if torch.version.hip:
+        # The per-sample reference uses the kernel that tree attention picks for this device. Qwen4-Exp's indexed
+        # attention runs on eager or SDPA only: its indexer needs the full 4D mask.
+        if model.config.model_type == "qwen4_exp":
+            reference = "sdpa"
+        elif torch.version.hip:
             reference = "kernels-community/aiter-flash-attn@v2"
         elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
             reference = "kernels-community/flash-attn4"
@@ -4436,6 +4450,81 @@ class TestTreePackingParity(TrlTestCase):
             torch.cat([g.flatten() for g in run.values()]) for run in (packed_grads, alone_grads)
         )
         assert (packed_grads - alone_grads).norm() < 2e-2 * alone_grads.norm()
+
+
+class TestTreeIndexedAttention(TrlTestCase):
+    """
+    Qwen4-Exp's indexed attention over a tree must match each sample alone through transformers' reference.
+
+    The layer alone, on the same inputs: its top-k block selection is a step function, so the full-model parity test
+    feeds it two numerically different hidden states and keeps every block in budget. Here the budget is cut to 16
+    tokens, so the sparse selection runs across the forks of the tree.
+    """
+
+    def test_outputs_and_grads_match_each_sample_alone(self):
+        pytest.importorskip("transformers.models.qwen4_exp")
+        model = AutoModelForImageTextToText.from_pretrained(
+            "ybelkada/tiny-Qwen4ExpForConditionalGeneration", dtype=torch.float32, attn_implementation="sdpa"
+        ).to(torch_device)
+        text = model.model.language_model
+        attention = next(layer for layer in text.layers if layer.layer_type == "indexed_attention").self_attn
+        attention.indexer.token_budget = 16
+        attention.indexer.block_topk = 16 // attention.indexer.compress_ratio
+        apply_rotary_pos_emb = sys.modules[type(attention).__module__].apply_rotary_pos_emb
+
+        samples = []
+        for group_id in range(2):
+            prompt = [1 + 100 * group_id + i for i in range(64)]
+            completions = [[1000 + 100 * i + j for j in range(24)] for i in range(4)]
+            completions += [completions[0][:12] + [2000 + 100 * i + j for j in range(12)] for i in range(2)]
+            samples += [_tree_sample(prompt + c, len(prompt), group_id=group_id) for c in completions]
+        packed = {key: value.to(torch_device) for key, value in _tree_row(samples).pack().items()}
+
+        # A token's input depends on its id and depth only, so a token shared by several samples gets one input
+        torch.manual_seed(0)
+        embedding = torch.randn(3000, text.config.hidden_size, device=torch_device)
+        depth_embedding = torch.randn(128, text.config.hidden_size, device=torch_device)
+        weights = torch.randn(len(packed["token_index"]), text.config.hidden_size, device=torch_device)
+
+        def rope(position_ids):
+            return text.rotary_emb(embedding[None, :1], position_ids.view(1, 1, -1).expand(3, 1, -1))
+
+        def run(packed_forward):
+            attention.zero_grad()
+            tables = [table.clone().requires_grad_() for table in (embedding, depth_embedding)]
+            if packed_forward:
+                hidden = tables[0][packed["input_ids"]] + tables[1][packed["position_ids"]]
+                tree = {key: packed[key] for key in ("tree_kv_index", "tree_cu_seqlens_q", "tree_cu_seqlens_k")}
+                out = tree_qsa_attention(
+                    attention, hidden[None], rope(packed["position_ids"]), tree, apply_rotary_pos_emb
+                )
+                # The positions whose next token is trained, one row per loss term, as the loss reads them
+                out = out[0][packed["token_index"]]
+            else:
+                out = []
+                for sample in samples:
+                    ids, n_prompt = (
+                        torch.from_numpy(sample["input_ids"]).to(torch_device),
+                        sample["completion_mask"].argmax(),
+                    )
+                    positions = torch.arange(len(ids), device=torch_device)
+                    hidden = tables[0][ids] + tables[1][positions]
+                    causal = torch.ones(len(ids), len(ids), dtype=torch.bool, device=torch_device).tril()[None, None]
+                    sample_out, _ = attention(hidden[None], rope(positions), causal)
+                    out.append(sample_out[0][n_prompt - 1 : len(ids) - 1])
+                out = torch.cat(out)
+            (out * weights).sum().backward()
+            grads = {name: p.grad.clone() for name, p in attention.named_parameters() if p.grad is not None}
+            grads.update(embedding=tables[0].grad, depth_embedding=tables[1].grad)
+            return out.detach(), grads
+
+        packed_out, packed_grads = run(packed_forward=True)
+        alone_out, alone_grads = run(packed_forward=False)
+
+        torch.testing.assert_close(packed_out, alone_out, atol=1e-5, rtol=1e-5)
+        assert packed_grads.keys() == alone_grads.keys()
+        for name, grad in alone_grads.items():
+            assert (packed_grads[name] - grad).norm() < 1e-4 * grad.norm(), name
 
 
 class TestTreePackingRefusesUnsupportedModels(TrlTestCase):

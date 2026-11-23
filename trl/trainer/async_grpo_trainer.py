@@ -423,13 +423,82 @@ def patch_tree_recurrent(model, layer_type: str) -> bool:
         def wrapper(*args, **kwargs):
             if "tree_segment_parents" not in kwargs:
                 return op(*args, **kwargs)
-            return tree_op(op, *args, **kwargs)
+            # Triton launches on the current device, not the inputs': with a model split over GPUs (`device_map`), a
+            # layer on another GPU would run on the wrong stream and read inputs not yet written
+            device = next(t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)).device
+            with torch.cuda.device(device):
+                return tree_op(op, *args, **kwargs)
 
         return wrapper
 
     for name, tree_op in tree_ops.items():
         setattr(modeling, name, follow_tree(names[name], tree_op))
     _PATCHED.add(modeling)
+    return True
+
+
+_PATCHED_QWEN4_EXP = set()
+
+
+def patch_tree_qwen4_exp(model) -> bool:
+    """
+    Make Qwen4-Exp's indexed attention and per-layer n-gram embedding (PLE) follow the tree of a tree-packed forward.
+
+    Both read across tokens outside the attention interface and the functions [`patch_tree_recurrent`] wraps: the
+    indexer picks each query's key blocks among all the tokens it sees, and PLE hashes each token with the ones before
+    it and runs a dilated convolution over them. Given the tree of [`~packing.TreeRow.pack`], the attention and PLE
+    forwards follow it (see `trl/kernels/tree_qwen4_exp.py`); otherwise they run unchanged. The gated DeltaNet layers
+    are left to [`patch_tree_recurrent`].
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]):
+            Model to patch.
+
+    Returns:
+        `bool`: whether the model's modeling module is Qwen4-Exp's.
+    """
+    modeling = sys.modules[type(model).forward.__module__]
+    names = ("Qwen4ExpTextAttention", "Qwen4ExpTextPLELayer", "Qwen4ExpTextDecoderLayer")
+    attention, ple, decoder = (vars(modeling).get(name) for name in names)
+    if attention is None or ple is None or decoder is None:
+        return False
+    # accelerate's `device_map` hooks call the forward a module had when the model was dispatched, saved as
+    # `_old_forward`: point them at the patched one too, or a split model keeps running the reference
+    for module in model.modules():
+        if isinstance(module, (attention, ple, decoder)) and "_old_forward" in vars(module):
+            module._old_forward = lambda *args, module=module, **kwargs: type(module).forward(module, *args, **kwargs)
+    if modeling in _PATCHED_QWEN4_EXP:
+        return True
+    from ..kernels.tree_qwen4_exp import tree_parent_index, tree_ple, tree_qsa_attention
+
+    attention_forward, ple_forward, decoder_forward = attention.forward, ple.forward, decoder.forward
+
+    def attention_forward_(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+        if "tree_kv_index" not in kwargs:
+            return attention_forward(
+                self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs
+            )
+        # On the inputs' GPU: with a model split over GPUs (`device_map`), the current device is another one
+        with torch.cuda.device(hidden_states.device):
+            return tree_qsa_attention(
+                self, hidden_states, position_embeddings, kwargs, modeling.apply_rotary_pos_emb
+            ), None
+
+    # The decoder layer calls PLE without the forward's keyword arguments, so it hands PLE the tree here
+    def decoder_forward_(self, hidden_states, *args, **kwargs):
+        if self.ple is not None:
+            tree = "tree_segment_parents" in kwargs
+            self.ple.tree_parent_index = tree_parent_index(kwargs, hidden_states.shape[1]) if tree else None
+        return decoder_forward(self, hidden_states, *args, **kwargs)
+
+    def ple_forward_(self, hidden_states, input_ids, past_key_values, conv_mask=None):
+        if self.tree_parent_index is None:
+            return ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=conv_mask)
+        with torch.cuda.device(hidden_states.device):
+            return tree_ple(self, hidden_states, input_ids, self.tree_parent_index)
+
+    attention.forward, decoder.forward, ple.forward = attention_forward_, decoder_forward_, ple_forward_
+    _PATCHED_QWEN4_EXP.add(modeling)
     return True
 
 
@@ -3057,12 +3126,17 @@ class AsyncGRPOTrainer(_BaseTrainer):
             "moe",
             "mlp",
         }
+        # Qwen4-Exp's indexed attention and n-gram embedding read across tokens too: once patched, only its gated
+        # DeltaNet layers are left to check
+        if layer_types == {"linear_attention", "indexed_attention"} and patch_tree_qwen4_exp(model):
+            layer_types = {"linear_attention"}
         # Check tree attention compat
         if layer_types not in (set(), {"linear_attention"}, {"conv"}):
             raise ValueError(
                 f"{type(model).__name__} has {sorted(layer_types)} layers. Tree packing routes attention, "
-                "transformers' gated DeltaNet and Mamba2 layers and LFM2's short convolutions along each sample's own "
-                "path; any other recurrent or convolutional layer would scan across samples."
+                "transformers' gated DeltaNet and Mamba2 layers, LFM2's short convolutions and Qwen4-Exp's indexed "
+                "attention along each sample's own path; any other recurrent or convolutional layer would scan across "
+                "samples."
             )
         if layer_types == {"linear_attention"} and Version(transformers.__version__) < Version("5.15.0"):
             raise ValueError(

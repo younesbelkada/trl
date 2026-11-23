@@ -433,6 +433,113 @@ def patch_tree_recurrent(model, layer_type: str) -> bool:
     return True
 
 
+_PATCHED_INKLING2_LOOP = set()
+_IN_TREE_FORWARD = set()
+
+
+def patch_tree_inkling2_loop(model) -> bool:
+    """
+    Make Inkling 2 Loop's attention and short convolutions follow the tree of a tree-packed forward.
+
+    Its attention adds a learned bias per query-key distance and a sink logit per query, which the FlashAttention
+    kernel of [`tree_attention`] cannot, and its short convolutions don't pass the forward's keyword arguments to the
+    functions [`patch_tree_recurrent`] wraps. Given the tree of [`~packing.TreeRow.pack`], the attention and both kinds
+    of short convolution follow it (see `trl/kernels/tree_inkling2_loop.py`); otherwise they run unchanged. The looped
+    core works position by position and needs nothing, but its attention residuals, which attend over the depth of one
+    position through the attention interface, are kept on eager attention so they never reach [`tree_attention`].
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]):
+            Model to patch.
+
+    Returns:
+        `bool`: whether the model's modeling module is Inkling 2 Loop's.
+    """
+    modeling = sys.modules[type(model).forward.__module__]
+    names = (
+        "Inkling2LoopSlidingAttention",
+        "Inkling2LoopFullAttention",
+        "Inkling2LoopShortConvolution",
+        "Inkling2LoopDynamicShortConvolution",
+        "Inkling2LoopTextModel",
+        "Inkling2LoopMessageAttentionResidual",
+        "Inkling2LoopBlockAttentionResidual",
+    )
+    classes = [vars(modeling).get(name) for name in names]
+    if any(cls is None for cls in classes):
+        return False
+    sliding, full, short_conv, dynamic_conv, text_model, message_residual, block_residual = classes
+    # Per model: the residuals get their own config, on eager attention, as the model is switched to tree attention
+    for module in model.modules():
+        if isinstance(module, (message_residual, block_residual)):
+            module.config = copy.copy(module.config)
+            module.config._attn_implementation = "eager"
+    # accelerate's `device_map` hooks call the forward a module had when the model was dispatched, saved as
+    # `_old_forward`: point them at the patched one too, or a split model keeps running the reference
+    patched = (sliding, full, short_conv, dynamic_conv, text_model)
+    for module in model.modules():
+        if isinstance(module, patched) and "_old_forward" in vars(module):
+            module._old_forward = lambda *args, module=module, **kwargs: type(module).forward(module, *args, **kwargs)
+    if modeling in _PATCHED_INKLING2_LOOP:
+        return True
+    from ..kernels.tree_inkling2_loop import (
+        tree_dynamic_short_convolution,
+        tree_inkling2_loop_attention,
+        tree_short_convolution,
+    )
+
+    def follow_tree(cls, tree_forward):
+        forward = cls.forward
+
+        def wrapper(self, *args, **kwargs):
+            if "tree_segment_parents" not in kwargs:
+                return forward(self, *args, **kwargs)
+            # On the inputs' GPU: with a model split over GPUs (`device_map`), the current device is another one
+            with torch.cuda.device(next(t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)).device):
+                return tree_forward(self, *args, **kwargs)
+
+        cls.forward = wrapper
+
+    def attention(self, hidden_states, key_hidden_states=None, value_hidden_states=None, conv_mask=None, **kwargs):
+        for name in ("attention_mask", "relative_distance", "cache", "cache_offset"):
+            kwargs.pop(name, None)
+        return tree_inkling2_loop_attention(
+            self, hidden_states, key_hidden_states, value_hidden_states, conv_mask, kwargs
+        )
+
+    for cls in (sliding, full):
+        follow_tree(cls, attention)
+    follow_tree(short_conv, lambda self, hidden_states, *args, **kwargs: tree_short_convolution(
+        self, modeling.causal_conv1d_fn, hidden_states, kwargs
+    ))  # fmt: skip
+    follow_tree(dynamic_conv, lambda self, hidden_states, dynamic_input, *args, **kwargs: tree_dynamic_short_convolution(
+        self, hidden_states, dynamic_input, kwargs
+    ))  # fmt: skip
+
+    # The text model builds dense `(N, N)` relative distances for the reference attention, gigabytes at training lengths.
+    # The tree attention computes its own from depths, so during a tree-packed forward they are a broadcast placeholder.
+    get_relative_distance, text_forward = modeling.get_relative_distance, text_model.forward
+
+    def relative_distance(inputs_embeds, cache, is_sliding):
+        if modeling not in _IN_TREE_FORWARD:
+            return get_relative_distance(inputs_embeds, cache, is_sliding)
+        n = inputs_embeds.shape[1]
+        return torch.zeros((), dtype=torch.long, device=inputs_embeds.device).expand(n, n)
+
+    def text_model_forward(self, *args, **kwargs):
+        if "tree_segment_parents" not in kwargs:
+            return text_forward(self, *args, **kwargs)
+        _IN_TREE_FORWARD.add(modeling)
+        try:
+            return text_forward(self, *args, **kwargs)
+        finally:
+            _IN_TREE_FORWARD.discard(modeling)
+
+    modeling.get_relative_distance, text_model.forward = relative_distance, text_model_forward
+    _PATCHED_INKLING2_LOOP.add(modeling)
+    return True
+
+
 logger = get_logger(__name__)
 
 
@@ -3057,12 +3164,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
             "moe",
             "mlp",
         }
+        # Inkling 2 Loop's hybrid layers are attention plus short convolutions: once patched, nothing is left to check
+        if layer_types <= {"hybrid", "hybrid_sliding"} and layer_types and patch_tree_inkling2_loop(model):
+            layer_types = set()
         # Check tree attention compat
         if layer_types not in (set(), {"linear_attention"}, {"conv"}):
             raise ValueError(
                 f"{type(model).__name__} has {sorted(layer_types)} layers. Tree packing routes attention, "
-                "transformers' gated DeltaNet and Mamba2 layers and LFM2's short convolutions along each sample's own "
-                "path; any other recurrent or convolutional layer would scan across samples."
+                "transformers' gated DeltaNet and Mamba2 layers, LFM2's short convolutions and Inkling 2 Loop's "
+                "hybrid layers along each sample's own path; any other recurrent or convolutional layer would scan "
+                "across samples."
             )
         if layer_types == {"linear_attention"} and Version(transformers.__version__) < Version("5.15.0"):
             raise ValueError(

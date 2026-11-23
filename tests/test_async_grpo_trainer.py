@@ -4313,17 +4313,14 @@ _LFM2_CONV_BEFORE_5_22 = pytest.mark.skipif(
         pytest.param("trl-internal-testing/tiny-Gemma4ForConditionalGeneration", {}, id="gemma4"),
         pytest.param(
             "trl-internal-testing/tiny-Inkling2LoopForConditionalGeneration",
-            {},
+            # In float32: the looped core runs its layers three times, and bfloat16 rounding compounds over those passes
+            # into a uniform ~3% gradient difference, past the tolerance; the tree path itself matches to ~1e-5
+            {"dtype": "float32"},
             id="inkling2_loop",
             marks=[
                 pytest.mark.skipif(
                     Version(transformers.__version__) < Version("5.24.0"),
                     reason="Inkling 2 Mini models were introduced in transformers-5.24.0",
-                ),
-                pytest.mark.xfail(
-                    raises=ValueError,
-                    reason="Tree packing doesn't support Inkling 2 Mini's hybrid layers",
-                    strict=True,
                 ),
             ],
         ),
@@ -4400,8 +4397,11 @@ class TestTreePackingParity(TrlTestCase):
                 param.data.fill_(-4.0)
         samples = self._samples(truncated)
         collator = DataCollatorForRollout(pad_token_id=0)
-        # The per-sample reference uses the kernel that tree attention picks for this device
-        if torch.version.hip:
+        # The per-sample reference uses the kernel that tree attention picks for this device. Inkling 2 Loop's
+        # attention adds a relative bias and sinks, which only its eager path computes.
+        if model.config.model_type == "inkling2_loop":
+            reference = "eager"
+        elif torch.version.hip:
             reference = "kernels-community/aiter-flash-attn@v2"
         elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
             reference = "kernels-community/flash-attn4"
